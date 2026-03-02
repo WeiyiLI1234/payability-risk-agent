@@ -1,3 +1,5 @@
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
 import { NextResponse } from "next/server";
 import { getDailyChangeData } from "@/lib/bigquery";
 import { flagSuppliers } from "@/lib/risk-engine";
@@ -13,7 +15,7 @@ export async function GET() {
       summary: {
         total_suppliers: result.total,
         flagged_count: result.flagged.length,
-        unflagged_count: result.unflagged,
+        unflagged_count: result.total - result.flagged.length,
       },
       flagged_suppliers: result.flagged,
     });
