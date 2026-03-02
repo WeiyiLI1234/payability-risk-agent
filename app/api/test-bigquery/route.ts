@@ -1,3 +1,5 @@
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
 import { BigQuery } from "@google-cloud/bigquery";
 import { NextResponse } from "next/server";
 
