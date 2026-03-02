@@ -1,202 +1,246 @@
-// lib/risk-engine.ts
+// lib/risk-engine.ts (v2: tighter WoW + absolute delta gate)
 
 export type DailyChangeRow = {
-  supplier_key: string | null;
-  supplier_name: string | null;
-
-  today_receivable: number | null;
-  prev_receivable: number | null;
-
-  today_liability: number | null;
-  prev_liability: number | null;
-
-  today_net_earning: number | null;
-  today_chargeback: number | null;
-  today_available_balance: number | null;
-  today_outstanding_bal: number | null;
-
-  receivable_change_pct: number | null;
-  liability_change_pct: number | null;
-
-  // From BigQuery query (optional, but supported)
-  has_prev_week_data?: boolean | null;
-};
-
-export type FlaggedSupplier = {
   supplier_key: string;
   supplier_name: string;
 
-  prev_receivable: number;
   today_receivable: number;
+  prev_receivable: number | null;
 
-  prev_liability: number;
   today_liability: number;
+  prev_liability: number | null;
+
+  today_net_earning: number; // keep for display/debug only (NOT used for rule decision)
+  today_chargeback: number;
+
+  today_available_balance: number;
+  today_outstanding_bal: number;
 
   receivable_change_pct: number | null;
   liability_change_pct: number | null;
 
-  today_net_earning: number;
-  today_chargeback: number;
-  today_available_balance: number;
-  today_outstanding_bal: number;
+  has_prev_week_data: boolean;
+};
 
+export type FlaggedSupplier = DailyChangeRow & {
   receivable_flagged: boolean;
   liability_flagged: boolean;
-
-  // extra context for debugging / prompt
-  has_prev_week_data: boolean;
-
+  net_earning_flagged: boolean;
+  available_balance_flagged: boolean;
   flag_reasons: string[];
 };
 
-export type RiskEngineResult = {
+export type FlagSuppliersResult = {
   total: number;
   flagged: FlaggedSupplier[];
-  unflagged: number;
+  unflagged: FlaggedSupplier[];
 };
 
-// ====== Tunables (intentionally loose for MVP/framework) ======
-const THRESHOLD_PCT = 10; // abs(% change) > 10 triggers
-const CHARGEBACK_NONZERO = 0; // any non-zero triggers reason (loose)
-const NEGATIVE_EARNING_FLAG = true;
-const NEGATIVE_AVAILABLE_BALANCE_FLAG = true;
+/**
+ * =========================
+ * THRESHOLDS (tune here)
+ * =========================
+ *
+ * Goal: produce a manageable manual-review list.
+ * WoW % change can be noisy -> require BOTH:
+ * - pct threshold
+ * - material base amount
+ * - absolute delta threshold
+ */
+const THRESHOLDS = {
+  // Rule 1: WoW absolute % change threshold
+  WOW_PCT_THRESHOLD: 50,
 
-// ====== Helpers ======
-function n(v: number | null | undefined): number {
-  return typeof v === "number" && Number.isFinite(v) ? v : 0;
+  // Rule 1 materiality: require metric "large enough"
+  MIN_BASE_RECEIVABLE: 25_000,
+  MIN_BASE_LIABILITY: 25_000,
+
+  // Rule 1 delta gate: require absolute move in dollars
+  MIN_ABS_DELTA_RECEIVABLE: 10_000,
+  MIN_ABS_DELTA_LIABILITY: 10_000,
+
+  // Rule 2: computed net earnings = receivables - chargebacks
+  // Add materiality to avoid flagging tiny negatives
+  MIN_NEG_NET_EARNING: -5_000,
+  MIN_CHARGEBACK_FOR_NET_RULE: 2_000,
+
+  // Rule 3: available balance negative threshold
+  MIN_NEG_AVAILABLE_BALANCE: -5_000,
+};
+
+function safeNum(x: unknown): number {
+  const n = typeof x === "number" ? x : Number(x);
+  return Number.isFinite(n) ? n : 0;
 }
 
-function pct(v: number | null | undefined): number | null {
-  return typeof v === "number" && Number.isFinite(v) ? v : null;
+function fmtMoney(n: number) {
+  const x = safeNum(n);
+  return `$${x.toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
 }
 
-function money(v: number): string {
-  // keep it simple; you can swap to Intl.NumberFormat later
-  return `$${v.toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
+function fmtPct(n: number) {
+  const x = safeNum(n);
+  return `${x.toFixed(2)}%`;
 }
 
-function absPctFlag(p: number | null, threshold: number): boolean {
-  return p !== null && Math.abs(p) > threshold;
+function baseAbs(today: number, prev: number | null) {
+  return Math.max(Math.abs(safeNum(today)), Math.abs(safeNum(prev ?? 0)));
 }
 
-export function flagSuppliers(rows: DailyChangeRow[]): RiskEngineResult {
-  const total = Array.isArray(rows) ? rows.length : 0;
-  const flagged: FlaggedSupplier[] = [];
+export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
+  // counters for quick sanity checks
+  let wowCount = 0;
+  let negNetCount = 0;
+  let negBalCount = 0;
 
-  for (const r of rows || []) {
-    const supplier_key = (r?.supplier_key ?? "").toString().trim();
-    const supplier_name = (r?.supplier_name ?? "").toString().trim();
-
-    // Skip malformed rows (prevents empty supplier buckets)
-    if (!supplier_key || !supplier_name) continue;
-
-    const today_receivable = n(r.today_receivable);
-    const prev_receivable = n(r.prev_receivable);
-
-    const today_liability = n(r.today_liability);
-    const prev_liability = n(r.prev_liability);
-
-    const today_net_earning = n(r.today_net_earning);
-    const today_chargeback = n(r.today_chargeback);
-    const today_available_balance = n(r.today_available_balance);
-    const today_outstanding_bal = n(r.today_outstanding_bal);
-
-    const receivable_change_pct = pct(r.receivable_change_pct);
-    const liability_change_pct = pct(r.liability_change_pct);
-
-    const has_prev_week_data = Boolean(r.has_prev_week_data);
-
+  const scored: FlaggedSupplier[] = rows.map((r) => {
     const reasons: string[] = [];
 
-    // ===== Core rules: abs % change > threshold =====
-    const receivable_flagged = absPctFlag(receivable_change_pct, THRESHOLD_PCT);
-    const liability_flagged = absPctFlag(liability_change_pct, THRESHOLD_PCT);
+    const todayReceivable = safeNum(r.today_receivable);
+    const prevReceivable = r.prev_receivable === null ? null : safeNum(r.prev_receivable);
+
+    const todayLiability = safeNum(r.today_liability);
+    const prevLiability = r.prev_liability === null ? null : safeNum(r.prev_liability);
+
+    const receivablePct =
+      r.receivable_change_pct === null ? null : safeNum(r.receivable_change_pct);
+    const liabilityPct = r.liability_change_pct === null ? null : safeNum(r.liability_change_pct);
+
+    // -------------------------
+    // Rule 1: WoW % move + materiality + absolute delta gate
+    // -------------------------
+    const receivableBase = baseAbs(todayReceivable, prevReceivable);
+    const liabilityBase = baseAbs(todayLiability, prevLiability);
+
+    const receivableDelta = Math.abs(todayReceivable - (prevReceivable ?? 0));
+    const liabilityDelta = Math.abs(todayLiability - (prevLiability ?? 0));
+
+    const receivable_material = receivableBase >= THRESHOLDS.MIN_BASE_RECEIVABLE;
+    const liability_material = liabilityBase >= THRESHOLDS.MIN_BASE_LIABILITY;
+
+    const receivable_flagged =
+      receivablePct !== null &&
+      Math.abs(receivablePct) >= THRESHOLDS.WOW_PCT_THRESHOLD &&
+      receivable_material &&
+      receivableDelta >= THRESHOLDS.MIN_ABS_DELTA_RECEIVABLE;
+
+    const liability_flagged =
+      liabilityPct !== null &&
+      Math.abs(liabilityPct) >= THRESHOLDS.WOW_PCT_THRESHOLD &&
+      liability_material &&
+      liabilityDelta >= THRESHOLDS.MIN_ABS_DELTA_LIABILITY;
 
     if (receivable_flagged) {
-      const dir = receivable_change_pct! > 0 ? "up" : "down";
       reasons.push(
-        `Receivable ${dir} ${Math.abs(receivable_change_pct!).toFixed(2)}% WoW: ${money(prev_receivable)} → ${money(today_receivable)}`
+        `Receivables WoW change ${fmtPct(receivablePct!)} (Δ ${fmtMoney(
+          receivableDelta
+        )}; base ${fmtMoney(receivableBase)}; prev ${fmtMoney(prevReceivable ?? 0)} → today ${fmtMoney(
+          todayReceivable
+        )})`
       );
     }
 
     if (liability_flagged) {
-      const dir = liability_change_pct! > 0 ? "up" : "down";
       reasons.push(
-        `Potential liability ${dir} ${Math.abs(liability_change_pct!).toFixed(2)}% WoW: ${money(prev_liability)} → ${money(today_liability)}`
+        `Potential liabilities WoW change ${fmtPct(liabilityPct!)} (Δ ${fmtMoney(
+          liabilityDelta
+        )}; base ${fmtMoney(liabilityBase)}; prev ${fmtMoney(prevLiability ?? 0)} → today ${fmtMoney(
+          todayLiability
+        )})`
       );
     }
 
-    // ===== Loose auxiliary rules (helps MVP feel real) =====
-    // 1) No baseline but non-zero today (data quality / new activity)
-    if (!has_prev_week_data) {
-      if (today_receivable !== 0) reasons.push("Receivable is non-zero with no prior-week baseline");
-      if (today_liability !== 0) reasons.push("Liability is non-zero with no prior-week baseline");
+    // -------------------------
+    // Rule 2: Negative Net Earnings (receivables - chargebacks) + materiality
+    // -------------------------
+    const todayChargeback = safeNum(r.today_chargeback);
+    const computed_net_earning = todayReceivable - todayChargeback;
+
+    const net_material = todayChargeback >= THRESHOLDS.MIN_CHARGEBACK_FOR_NET_RULE;
+    const net_earning_flagged =
+      net_material && computed_net_earning <= THRESHOLDS.MIN_NEG_NET_EARNING;
+
+    if (net_earning_flagged) {
+      reasons.push(
+        `Negative net earnings (receivables - chargebacks) ${fmtMoney(
+          computed_net_earning
+        )} (receivables ${fmtMoney(todayReceivable)} - chargebacks ${fmtMoney(todayChargeback)})`
+      );
     }
 
-    // 2) Any chargeback activity (very loose)
-    if (today_chargeback !== CHARGEBACK_NONZERO) {
-      reasons.push(`Chargeback is non-zero: ${money(today_chargeback)}`);
+    // -------------------------
+    // Rule 3: Negative available balance (with threshold)
+    // -------------------------
+    const todayAvail = safeNum(r.today_available_balance);
+    const available_balance_flagged = todayAvail <= THRESHOLDS.MIN_NEG_AVAILABLE_BALANCE;
+
+    if (available_balance_flagged) {
+      reasons.push(`Negative available balance: ${fmtMoney(todayAvail)}`);
     }
 
-    // 3) Negative net earning (loose)
-    if (NEGATIVE_EARNING_FLAG && today_net_earning < 0) {
-      reasons.push(`Net earning is negative: ${money(today_net_earning)}`);
-    }
+    if (receivable_flagged || liability_flagged) wowCount++;
+    if (net_earning_flagged) negNetCount++;
+    if (available_balance_flagged) negBalCount++;
 
-    // 4) Negative available balance (loose)
-    if (NEGATIVE_AVAILABLE_BALANCE_FLAG && today_available_balance < 0) {
-      reasons.push(`Available balance is negative: ${money(today_available_balance)}`);
-    }
+    const flagged =
+      receivable_flagged || liability_flagged || net_earning_flagged || available_balance_flagged;
 
-    // Decide: flag if any reason exists
-    // (keeps it intentionally permissive for framework build)
-    const isFlagged = reasons.length > 0;
+    return {
+      ...r,
+      receivable_flagged,
+      liability_flagged,
+      net_earning_flagged,
+      available_balance_flagged,
+      flag_reasons: flagged ? reasons : [],
+    };
+  });
 
-    if (isFlagged) {
-      flagged.push({
-        supplier_key,
-        supplier_name,
+  // Sort: more triggers first, then largest WoW swing, then exposure proxy
+  scored.sort((a, b) => {
+    const aTriggers =
+      Number(a.receivable_flagged) +
+      Number(a.liability_flagged) +
+      Number(a.net_earning_flagged) +
+      Number(a.available_balance_flagged);
+    const bTriggers =
+      Number(b.receivable_flagged) +
+      Number(b.liability_flagged) +
+      Number(b.net_earning_flagged) +
+      Number(b.available_balance_flagged);
 
-        prev_receivable,
-        today_receivable,
+    if (bTriggers !== aTriggers) return bTriggers - aTriggers;
 
-        prev_liability,
-        today_liability,
+    const aMaxWow = Math.max(
+      Math.abs(a.receivable_change_pct ?? 0),
+      Math.abs(a.liability_change_pct ?? 0)
+    );
+    const bMaxWow = Math.max(
+      Math.abs(b.receivable_change_pct ?? 0),
+      Math.abs(b.liability_change_pct ?? 0)
+    );
+    if (bMaxWow !== aMaxWow) return bMaxWow - aMaxWow;
 
-        receivable_change_pct,
-        liability_change_pct,
-
-        today_net_earning,
-        today_chargeback,
-        today_available_balance,
-        today_outstanding_bal,
-
-        receivable_flagged,
-        liability_flagged,
-
-        has_prev_week_data,
-        flag_reasons: reasons,
-      });
-    }
-  }
-
-  // Sorting: more severe first
-  // - both change flags first
-  // - then by max(abs change pct)
-  // - then by absolute $ exposure proxy (outstanding + abs(liability) + receivable)
-  flagged.sort((a, b) => {
-    const aCount = (a.receivable_flagged ? 1 : 0) + (a.liability_flagged ? 1 : 0);
-    const bCount = (b.receivable_flagged ? 1 : 0) + (b.liability_flagged ? 1 : 0);
-    if (bCount !== aCount) return bCount - aCount;
-
-    const aMax = Math.max(Math.abs(a.receivable_change_pct ?? 0), Math.abs(a.liability_change_pct ?? 0));
-    const bMax = Math.max(Math.abs(b.receivable_change_pct ?? 0), Math.abs(b.liability_change_pct ?? 0));
-    if (bMax !== aMax) return bMax - aMax;
-
-    const aExposure = Math.abs(a.today_outstanding_bal) + Math.abs(a.today_liability) + Math.abs(a.today_receivable);
-    const bExposure = Math.abs(b.today_outstanding_bal) + Math.abs(b.today_liability) + Math.abs(b.today_receivable);
+    const aExposure =
+      safeNum(a.today_outstanding_bal) +
+      Math.abs(safeNum(a.today_liability)) +
+      safeNum(a.today_receivable);
+    const bExposure =
+      safeNum(b.today_outstanding_bal) +
+      Math.abs(safeNum(b.today_liability)) +
+      safeNum(b.today_receivable);
     return bExposure - aExposure;
   });
 
-  return { total, flagged, unflagged: total - flagged.length };
+  const flagged = scored.filter((x) => x.flag_reasons.length > 0);
+  const unflagged = scored.filter((x) => x.flag_reasons.length === 0);
+
+  console.log("[risk-engine] triggers", {
+    total: rows.length,
+    flagged: flagged.length,
+    wow: wowCount,
+    neg_net_earning: negNetCount,
+    neg_available_balance: negBalCount,
+  });
+
+  return { total: rows.length, flagged, unflagged };
 }

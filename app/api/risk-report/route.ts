@@ -55,7 +55,7 @@ export async function GET() {
       summary: {
         total_suppliers: result.total,
         flagged_count: result.flagged.length,
-        unflagged_count: result.total - result.flagged.length,
+        unflagged_count: result.unflagged.length,
       },
 
       ai_report: report,

@@ -34,6 +34,7 @@ export async function GET() {
     console.log("[cron/daily-risk] Risk engine done", {
       total: result.total,
       flagged: result.flagged.length,
+      unflagged: result.unflagged.length,
       ms: Date.now() - start,
     });
 
@@ -82,15 +83,11 @@ export async function GET() {
         reasons: s.flag_reasons ?? [],
       }));
 
-      const { error: detailErr } = await sb
-        .from("agent_flagged_suppliers")
-        .insert(detailRows);
+      const { error: detailErr } = await sb.from("agent_flagged_suppliers").insert(detailRows);
 
       if (detailErr) {
         console.error("[cron/daily-risk] flagged details insert error", detailErr);
-        throw new Error(
-          `Supabase insert agent_flagged_suppliers failed: ${detailErr.message}`
-        );
+        throw new Error(`Supabase insert agent_flagged_suppliers failed: ${detailErr.message}`);
       }
 
       savedFlagged = detailRows.length;
@@ -100,6 +97,7 @@ export async function GET() {
       run_id: run.id,
       total: result.total,
       flagged: result.flagged.length,
+      unflagged: result.unflagged.length,
       saved_flagged: savedFlagged,
       ms: Date.now() - start,
     });
@@ -111,9 +109,11 @@ export async function GET() {
       summary: {
         total_suppliers: result.total,
         flagged_count: result.flagged.length,
+        unflagged_count: result.unflagged.length,
         saved_to_db: true,
         saved_flagged: savedFlagged,
       },
+      ai_report: report,
       debug: {
         rows_length: rows.length,
         execution_time_ms: Date.now() - start,
