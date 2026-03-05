@@ -1,38 +1,34 @@
-// lib/ai-report.ts
-//import { anthropic } from "@ai-sdk/anthropic";
+// lib/ai-report.ts (v4: standardized output format)
 import { generateText } from "ai";
 import type { FlaggedSupplier } from "@/lib/risk-engine";
-//import { openai } from "@ai-sdk/openai";
 
-export type RiskTier = "CRITICAL" | "HIGH" | "MONITOR";
+// === Output types matching target schema ===
+export type MetricEntry = {
+  metric_id: string;
+  value: number | null;
+  unit: string;
+  explanation: string;
+};
 
-export type RiskReportJSON = {
+export type SupplierRiskReport = {
+  table_name: string;
+  supplier_key: string;
+  report_date: string;
+  metrics: MetricEntry[];
+  overall_risk_score: number; // 0.00 - 1.00
+};
+
+export type RiskReportOutput = {
   report_date: string;
   suppliers_reviewed: number;
   portfolio_summary: {
-    critical_count: number;
-    high_count: number;
-    monitor_count: number;
+    critical_count: number;   // score >= 0.8
+    high_count: number;       // score 0.5 - 0.79
+    moderate_count: number;   // score < 0.5
+    total_exposure: number;
     notes: string[];
   };
-  suppliers: Array<{
-    supplier_key: string;
-    supplier_name: string;
-    risk_tier: RiskTier;
-    headline: string;
-    key_metrics: {
-      receivable: number;
-      chargeback: number;
-      computed_net_earning: number;
-      available_balance: number;
-      outstanding_balance: number;
-      receivable_wow_pct: number | null;
-      liability_wow_pct: number | null;
-    };
-    triggers: string[];
-    assessment: string[];
-    actions: string[];
-  }>;
+  suppliers: SupplierRiskReport[];
 };
 
 function safeNum(x: unknown): number {
@@ -40,21 +36,13 @@ function safeNum(x: unknown): number {
   return Number.isFinite(n) ? n : 0;
 }
 
-function coerceTier(x: unknown): RiskTier {
-  return x === "CRITICAL" || x === "HIGH" || x === "MONITOR" ? x : "HIGH";
-}
-
 function stripCodeFences(s: string) {
   return s.replace(/```json\s*/g, "").replace(/```\s*/g, "").trim();
 }
 
-/**
- * ✅ Main API: JSON structured report.
- */
 export async function generateRiskReportJSON(
-  flagged: FlaggedSupplier[],
-  opts?: { model?: string }
-): Promise<RiskReportJSON> {
+  flagged: FlaggedSupplier[]
+): Promise<RiskReportOutput> {
   const reportDate = new Date().toISOString().slice(0, 10);
 
   const payload = flagged.map((s) => {
@@ -65,6 +53,7 @@ export async function generateRiskReportJSON(
     return {
       supplier_key: s.supplier_key,
       supplier_name: s.supplier_name,
+      engine_risk_score: s.risk_score,
       receivable,
       chargeback,
       computed_net_earning: computedNet,
@@ -72,70 +61,81 @@ export async function generateRiskReportJSON(
       outstanding_balance: safeNum(s.today_outstanding_bal),
       receivable_wow_pct: s.receivable_change_pct ?? null,
       liability_wow_pct: s.liability_change_pct ?? null,
+      prev_receivable: safeNum(s.prev_receivable ?? 0),
+      prev_liability: safeNum(s.prev_liability ?? 0),
+      today_liability: safeNum(s.today_liability),
       flag_reasons: Array.isArray(s.flag_reasons) ? s.flag_reasons : [],
     };
   });
 
   const system = `
-You are a risk analyst.
+You are a financial risk analyst at Payability (Amazon seller cash advance provider).
 You MUST output valid JSON and NOTHING else (no markdown, no backticks, no commentary).
 
-Rules:
-- Do NOT invent triggers. "triggers" must be derived ONLY from input.flag_reasons (you may shorten/rephrase).
-- Use tiers:
-  - CRITICAL: immediate escalation/freeze recommended
-  - HIGH: manual review required within 24-72h
-  - MONITOR: watchlist
+For each supplier, output an object with:
+- "table_name": always "vm_transaction_summary"
+- "supplier_key": from input
+- "report_date": "${reportDate}"
+- "metrics": array of metric objects, each with:
+  - "metric_id": one of RECEIVABLE_WOW_CHANGE, LIABILITY_WOW_CHANGE, CHARGEBACK_RATIO, NET_EARNING, AVAILABLE_BALANCE, OUTSTANDING_EXPOSURE
+  - "value": the numeric value
+  - "unit": appropriate unit (%, $, ratio)
+  - "explanation": 1-sentence explanation of what this metric means for risk
+- "overall_risk_score": your independent assessment as a decimal 0.00-1.00
+  - 0.00-0.39 = low/moderate risk
+  - 0.40-0.69 = elevated risk
+  - 0.70-0.89 = high risk
+  - 0.90-1.00 = critical risk
 
-Return a single JSON object exactly matching the schema.
+Rules:
+- Include ALL 6 metric_ids for every supplier, even if value is null
+- "explanation" for each metric must reference the actual numbers
+- overall_risk_score must reflect the full financial picture, not just flag_reasons
+- Do NOT invent data. Use only what is provided.
 `.trim();
 
   const prompt = `
 Return JSON matching this schema:
 
 {
-  "report_date": string,
-  "suppliers_reviewed": number,
+  "report_date": "${reportDate}",
+  "suppliers_reviewed": ${payload.length},
   "portfolio_summary": {
     "critical_count": number,
     "high_count": number,
-    "monitor_count": number,
+    "moderate_count": number,
+    "total_exposure": number,
     "notes": string[]
   },
   "suppliers": [
     {
+      "table_name": "vm_transaction_summary",
       "supplier_key": string,
-      "supplier_name": string,
-      "risk_tier": "CRITICAL" | "HIGH" | "MONITOR",
-      "headline": string,
-      "key_metrics": {
-        "receivable": number,
-        "chargeback": number,
-        "computed_net_earning": number,
-        "available_balance": number,
-        "outstanding_balance": number,
-        "receivable_wow_pct": number|null,
-        "liability_wow_pct": number|null
-      },
-      "triggers": string[],
-      "assessment": string[],
-      "actions": string[]
+      "report_date": "${reportDate}",
+      "metrics": [
+        { "metric_id": "RECEIVABLE_WOW_CHANGE", "value": number|null, "unit": "%", "explanation": string },
+        { "metric_id": "LIABILITY_WOW_CHANGE", "value": number|null, "unit": "%", "explanation": string },
+        { "metric_id": "CHARGEBACK_RATIO", "value": number, "unit": "ratio", "explanation": string },
+        { "metric_id": "NET_EARNING", "value": number, "unit": "$", "explanation": string },
+        { "metric_id": "AVAILABLE_BALANCE", "value": number, "unit": "$", "explanation": string },
+        { "metric_id": "OUTSTANDING_EXPOSURE", "value": number, "unit": "$", "explanation": string }
+      ],
+      "overall_risk_score": number
     }
   ]
 }
 
 Constraints:
-- report_date must be "${reportDate}"
-- suppliers_reviewed must be ${payload.length}
 - suppliers array length must equal ${payload.length}
-- triggers must be based ONLY on flag_reasons for each supplier.
+- portfolio_summary counts based on overall_risk_score: critical >= 0.8, high 0.5-0.79, moderate < 0.5
+- total_exposure = sum of all outstanding_balance values
+- CHARGEBACK_RATIO = chargeback / receivable (0-1 scale)
 
 Input suppliers:
 ${JSON.stringify(payload)}
 `.trim();
 
   const { text } = await generateText({
-    //model: openai("gpt-4o-mini"),
     model: "openai/gpt-4o-mini",
     system,
     prompt,
@@ -156,44 +156,31 @@ ${JSON.stringify(payload)}
 
   const suppliers = Array.isArray(parsed?.suppliers) ? parsed.suppliers : [];
 
-  const report: RiskReportJSON = {
+  const report: RiskReportOutput = {
     report_date: String(parsed?.report_date ?? reportDate),
     suppliers_reviewed: safeNum(parsed?.suppliers_reviewed ?? payload.length),
     portfolio_summary: {
       critical_count: safeNum(parsed?.portfolio_summary?.critical_count),
       high_count: safeNum(parsed?.portfolio_summary?.high_count),
-      monitor_count: safeNum(parsed?.portfolio_summary?.monitor_count),
+      moderate_count: safeNum(parsed?.portfolio_summary?.moderate_count),
+      total_exposure: safeNum(parsed?.portfolio_summary?.total_exposure),
       notes: Array.isArray(parsed?.portfolio_summary?.notes)
         ? parsed.portfolio_summary.notes.map(String)
         : [],
     },
     suppliers: suppliers.map((x: any) => ({
+      table_name: String(x?.table_name ?? "vm_transaction_summary"),
       supplier_key: String(x?.supplier_key ?? ""),
-      supplier_name: String(x?.supplier_name ?? ""),
-      risk_tier: coerceTier(x?.risk_tier),
-      headline: String(x?.headline ?? ""),
-      key_metrics: {
-        receivable: safeNum(x?.key_metrics?.receivable),
-        chargeback: safeNum(x?.key_metrics?.chargeback),
-        computed_net_earning: safeNum(x?.key_metrics?.computed_net_earning),
-        available_balance: safeNum(x?.key_metrics?.available_balance),
-        outstanding_balance: safeNum(x?.key_metrics?.outstanding_balance),
-        receivable_wow_pct:
-          x?.key_metrics?.receivable_wow_pct === null
-            ? null
-            : Number.isFinite(Number(x?.key_metrics?.receivable_wow_pct))
-            ? Number(x?.key_metrics?.receivable_wow_pct)
-            : null,
-        liability_wow_pct:
-          x?.key_metrics?.liability_wow_pct === null
-            ? null
-            : Number.isFinite(Number(x?.key_metrics?.liability_wow_pct))
-            ? Number(x?.key_metrics?.liability_wow_pct)
-            : null,
-      },
-      triggers: Array.isArray(x?.triggers) ? x.triggers.map(String) : [],
-      assessment: Array.isArray(x?.assessment) ? x.assessment.map(String) : [],
-      actions: Array.isArray(x?.actions) ? x.actions.map(String) : [],
+      report_date: String(x?.report_date ?? reportDate),
+      metrics: Array.isArray(x?.metrics)
+        ? x.metrics.map((m: any) => ({
+            metric_id: String(m?.metric_id ?? ""),
+            value: m?.value === null ? null : safeNum(m?.value),
+            unit: String(m?.unit ?? ""),
+            explanation: String(m?.explanation ?? ""),
+          }))
+        : [],
+      overall_risk_score: Math.max(0, Math.min(1, safeNum(x?.overall_risk_score))),
     })),
   };
 
@@ -201,9 +188,7 @@ ${JSON.stringify(payload)}
 }
 
 /**
- * ✅ Compatibility alias (optional).
- * If any old code still imports generateRiskReport, it will still work.
- * You can remove this alias later once everything is migrated.
+ * Compatibility alias
  */
 export async function generateRiskReport(flagged: FlaggedSupplier[]) {
   const json = await generateRiskReportJSON(flagged);

@@ -1,4 +1,4 @@
-// lib/risk-engine.ts (v2: tighter WoW + absolute delta gate)
+// lib/risk-engine.ts (v3: 1-10 risk score)
 
 export type DailyChangeRow = {
   supplier_key: string;
@@ -10,7 +10,7 @@ export type DailyChangeRow = {
   today_liability: number;
   prev_liability: number | null;
 
-  today_net_earning: number; // keep for display/debug only (NOT used for rule decision)
+  today_net_earning: number;
   today_chargeback: number;
 
   today_available_balance: number;
@@ -28,6 +28,7 @@ export type FlaggedSupplier = DailyChangeRow & {
   net_earning_flagged: boolean;
   available_balance_flagged: boolean;
   flag_reasons: string[];
+  risk_score: number; // 1-10, 1 = lowest risk, 10 = highest risk
 };
 
 export type FlagSuppliersResult = {
@@ -36,35 +37,14 @@ export type FlagSuppliersResult = {
   unflagged: FlaggedSupplier[];
 };
 
-/**
- * =========================
- * THRESHOLDS (tune here)
- * =========================
- *
- * Goal: produce a manageable manual-review list.
- * WoW % change can be noisy -> require BOTH:
- * - pct threshold
- * - material base amount
- * - absolute delta threshold
- */
 const THRESHOLDS = {
-  // Rule 1: WoW absolute % change threshold
   WOW_PCT_THRESHOLD: 50,
-
-  // Rule 1 materiality: require metric "large enough"
   MIN_BASE_RECEIVABLE: 25_000,
   MIN_BASE_LIABILITY: 25_000,
-
-  // Rule 1 delta gate: require absolute move in dollars
   MIN_ABS_DELTA_RECEIVABLE: 10_000,
   MIN_ABS_DELTA_LIABILITY: 10_000,
-
-  // Rule 2: computed net earnings = receivables - chargebacks
-  // Add materiality to avoid flagging tiny negatives
   MIN_NEG_NET_EARNING: -5_000,
   MIN_CHARGEBACK_FOR_NET_RULE: 2_000,
-
-  // Rule 3: available balance negative threshold
   MIN_NEG_AVAILABLE_BALANCE: -5_000,
 };
 
@@ -87,8 +67,61 @@ function baseAbs(today: number, prev: number | null) {
   return Math.max(Math.abs(safeNum(today)), Math.abs(safeNum(prev ?? 0)));
 }
 
+/**
+ * Calculate risk score 1-10 based on how many rules triggered and severity.
+ * 1 = lowest risk, 10 = highest risk.
+ *
+ * Scoring:
+ * - Each flag type adds base points
+ * - Severity (magnitude of change, size of exposure) adds more points
+ * - Capped at 10
+ */
+function calculateRiskScore(
+  receivable_flagged: boolean,
+  liability_flagged: boolean,
+  net_earning_flagged: boolean,
+  available_balance_flagged: boolean,
+  receivablePct: number | null,
+  liabilityPct: number | null,
+  computedNetEarning: number,
+  availableBalance: number,
+  outstandingBal: number,
+  receivable: number
+): number {
+  let score = 0;
+
+  // --- Base points per flag triggered ---
+  // WoW receivable spike: +2
+  if (receivable_flagged) score += 2;
+  // WoW liability spike: +2
+  if (liability_flagged) score += 2;
+  // Negative net earnings: +2
+  if (net_earning_flagged) score += 2;
+  // Negative available balance: +2
+  if (available_balance_flagged) score += 2;
+
+  // --- Severity modifiers ---
+
+  // Extreme WoW swings (>100%) add extra point each
+  if (receivablePct !== null && Math.abs(receivablePct) > 100) score += 1;
+  if (liabilityPct !== null && Math.abs(liabilityPct) > 100) score += 1;
+
+  // Deeply negative net earnings (< -50K) adds a point
+  if (computedNetEarning < -50_000) score += 1;
+
+  // Large outstanding balance (> 500K) with other flags adds exposure risk
+  if (outstandingBal > 500_000 && score >= 2) score += 1;
+
+  // Chargeback exceeds receivable (chargeback ratio > 100%)
+  if (receivable > 0 && computedNetEarning < 0 && Math.abs(computedNetEarning) > receivable) {
+    score += 1;
+  }
+
+  // Clamp to 1-10 (minimum 1 since they're already flagged)
+  return Math.max(1, Math.min(10, score));
+}
+
 export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
-  // counters for quick sanity checks
   let wowCount = 0;
   let negNetCount = 0;
   let negBalCount = 0;
@@ -104,7 +137,8 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
 
     const receivablePct =
       r.receivable_change_pct === null ? null : safeNum(r.receivable_change_pct);
-    const liabilityPct = r.liability_change_pct === null ? null : safeNum(r.liability_change_pct);
+    const liabilityPct =
+      r.liability_change_pct === null ? null : safeNum(r.liability_change_pct);
 
     // -------------------------
     // Rule 1: WoW % move + materiality + absolute delta gate
@@ -182,8 +216,24 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
     if (net_earning_flagged) negNetCount++;
     if (available_balance_flagged) negBalCount++;
 
-    const flagged =
+    const isFlagged =
       receivable_flagged || liability_flagged || net_earning_flagged || available_balance_flagged;
+
+    // Calculate risk score for flagged suppliers
+    const risk_score = isFlagged
+      ? calculateRiskScore(
+          receivable_flagged,
+          liability_flagged,
+          net_earning_flagged,
+          available_balance_flagged,
+          receivablePct,
+          liabilityPct,
+          computed_net_earning,
+          todayAvail,
+          safeNum(r.today_outstanding_bal),
+          todayReceivable
+        )
+      : 0;
 
     return {
       ...r,
@@ -191,24 +241,14 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
       liability_flagged,
       net_earning_flagged,
       available_balance_flagged,
-      flag_reasons: flagged ? reasons : [],
+      flag_reasons: isFlagged ? reasons : [],
+      risk_score,
     };
   });
 
-  // Sort: more triggers first, then largest WoW swing, then exposure proxy
+  // Sort: highest risk score first, then by exposure
   scored.sort((a, b) => {
-    const aTriggers =
-      Number(a.receivable_flagged) +
-      Number(a.liability_flagged) +
-      Number(a.net_earning_flagged) +
-      Number(a.available_balance_flagged);
-    const bTriggers =
-      Number(b.receivable_flagged) +
-      Number(b.liability_flagged) +
-      Number(b.net_earning_flagged) +
-      Number(b.available_balance_flagged);
-
-    if (bTriggers !== aTriggers) return bTriggers - aTriggers;
+    if (b.risk_score !== a.risk_score) return b.risk_score - a.risk_score;
 
     const aMaxWow = Math.max(
       Math.abs(a.receivable_change_pct ?? 0),
@@ -240,6 +280,11 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
     wow: wowCount,
     neg_net_earning: negNetCount,
     neg_available_balance: negBalCount,
+    score_distribution: {
+      "8-10 (critical)": flagged.filter((x) => x.risk_score >= 8).length,
+      "5-7 (high)": flagged.filter((x) => x.risk_score >= 5 && x.risk_score <= 7).length,
+      "1-4 (moderate)": flagged.filter((x) => x.risk_score >= 1 && x.risk_score <= 4).length,
+    },
   });
 
   return { total: rows.length, flagged, unflagged };
