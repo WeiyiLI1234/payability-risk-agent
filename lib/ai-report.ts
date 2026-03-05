@@ -1,8 +1,7 @@
-// lib/ai-report.ts (v4: standardized output format)
+// lib/ai-report.ts (v5: risk score 1-10 integer)
 import { generateText } from "ai";
 import type { FlaggedSupplier } from "@/lib/risk-engine";
 
-// === Output types matching target schema ===
 export type MetricEntry = {
   metric_id: string;
   value: number | null;
@@ -15,16 +14,16 @@ export type SupplierRiskReport = {
   supplier_key: string;
   report_date: string;
   metrics: MetricEntry[];
-  overall_risk_score: number; // 0.00 - 1.00
+  overall_risk_score: number; // 1-10 integer, 1 = lowest risk
 };
 
 export type RiskReportOutput = {
   report_date: string;
   suppliers_reviewed: number;
   portfolio_summary: {
-    critical_count: number;   // score >= 0.8
-    high_count: number;       // score 0.5 - 0.79
-    moderate_count: number;   // score < 0.5
+    critical_count: number;
+    high_count: number;
+    moderate_count: number;
     total_exposure: number;
     notes: string[];
   };
@@ -76,21 +75,32 @@ For each supplier, output an object with:
 - "table_name": always "vm_transaction_summary"
 - "supplier_key": from input
 - "report_date": "${reportDate}"
-- "metrics": array of metric objects, each with:
+- "metrics": array of 6 metric objects, each with:
   - "metric_id": one of RECEIVABLE_WOW_CHANGE, LIABILITY_WOW_CHANGE, CHARGEBACK_RATIO, NET_EARNING, AVAILABLE_BALANCE, OUTSTANDING_EXPOSURE
   - "value": the numeric value
   - "unit": appropriate unit (%, $, ratio)
-  - "explanation": 1-sentence explanation of what this metric means for risk
-- "overall_risk_score": your independent assessment as a decimal 0.00-1.00
-  - 0.00-0.39 = low/moderate risk
-  - 0.40-0.69 = elevated risk
-  - 0.70-0.89 = high risk
-  - 0.90-1.00 = critical risk
+  - "explanation": 1-sentence explanation referencing actual numbers
+- "overall_risk_score": INTEGER from 1 to 10
+  - 1-2: Low risk - healthy financials, normal fluctuations
+  - 3-4: Moderate risk - some minor concerns, standard monitoring
+  - 5-6: Elevated risk - needs attention within a week
+  - 7-8: High risk - manual review required within 24-72h
+  - 9-10: Critical risk - immediate escalation/freeze recommended
+
+Scoring guidance for overall_risk_score:
+- Start at 1 (healthy baseline)
+- Add +1-2 for each significant risk factor:
+  - Large WoW receivable swing (>50%): +1, (>200%): +2
+  - Large WoW liability increase (>50%): +1, (>200%): +2
+  - Chargeback ratio > 0.5: +1, > 0.9: +2
+  - Negative net earnings: +1, deeply negative (< -$50K): +2
+  - Negative available balance: +2
+  - Outstanding exposure > $500K with other flags: +1
+- Cap at 10
 
 Rules:
-- Include ALL 6 metric_ids for every supplier, even if value is null
-- "explanation" for each metric must reference the actual numbers
-- overall_risk_score must reflect the full financial picture, not just flag_reasons
+- Include ALL 6 metric_ids for every supplier
+- overall_risk_score MUST be an integer 1-10
 - Do NOT invent data. Use only what is provided.
 `.trim();
 
@@ -120,16 +130,17 @@ Return JSON matching this schema:
         { "metric_id": "AVAILABLE_BALANCE", "value": number, "unit": "$", "explanation": string },
         { "metric_id": "OUTSTANDING_EXPOSURE", "value": number, "unit": "$", "explanation": string }
       ],
-      "overall_risk_score": number
+      "overall_risk_score": integer (1-10)
     }
   ]
 }
 
 Constraints:
 - suppliers array length must equal ${payload.length}
-- portfolio_summary counts based on overall_risk_score: critical >= 0.8, high 0.5-0.79, moderate < 0.5
+- overall_risk_score must be an INTEGER from 1 to 10. 1 = lowest risk. 10 = highest risk.
+- portfolio_summary counts based on overall_risk_score: critical = 8-10, high = 5-7, moderate = 1-4
 - total_exposure = sum of all outstanding_balance values
-- CHARGEBACK_RATIO = chargeback / receivable (0-1 scale)
+- CHARGEBACK_RATIO = chargeback / receivable (0-1+ scale)
 
 Input suppliers:
 ${JSON.stringify(payload)}
@@ -180,16 +191,13 @@ ${JSON.stringify(payload)}
             explanation: String(m?.explanation ?? ""),
           }))
         : [],
-      overall_risk_score: Math.max(0, Math.min(1, safeNum(x?.overall_risk_score))),
+      overall_risk_score: Math.max(1, Math.min(10, Math.round(safeNum(x?.overall_risk_score)))),
     })),
   };
 
   return report;
 }
 
-/**
- * Compatibility alias
- */
 export async function generateRiskReport(flagged: FlaggedSupplier[]) {
   const json = await generateRiskReportJSON(flagged);
   return JSON.stringify(json, null, 2);
