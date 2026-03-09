@@ -1,6 +1,6 @@
 // lib/risk-policy.ts
 
-export const RISK_POLICY_VERSION = "v3.0.0";
+export const RISK_POLICY_VERSION = "v3.1.0";
 
 export const RISK_THRESHOLDS = {
   receivableAnomaly: {
