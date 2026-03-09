@@ -1,3 +1,4 @@
+// lib/ai-report.ts
 import { generateText } from "ai";
 import type { FlaggedSupplier } from "@/lib/risk-engine";
 
@@ -23,6 +24,22 @@ export type RiskReportOutput = {
   suppliers: FinalSupplierRiskReport[];
 };
 
+type InputMetricForLLM = {
+  metric_id: string;
+  value: number | null;
+  unit: string;
+  explanation: string;
+  score_contribution: number;
+};
+
+type InputSupplierForLLM = {
+  supplier_key: string;
+  supplier_name: string;
+  overall_risk_score: number;
+  trigger_reasons: string[];
+  metrics: InputMetricForLLM[];
+};
+
 function safeNum(x: unknown): number {
   const n = typeof x === "number" ? x : Number(x);
   return Number.isFinite(n) ? n : 0;
@@ -41,15 +58,15 @@ export async function generateRiskReportJSON(
 ): Promise<RiskReportOutput> {
   const reportDate = new Date().toISOString().slice(0, 10);
 
-  const payload = flagged.map((s) => ({
+  const payload: InputSupplierForLLM[] = flagged.map((s) => ({
     supplier_key: s.supplier_key,
     supplier_name: s.supplier_name,
     overall_risk_score: safeNum(s.engine_suggested_risk_score),
     trigger_reasons: Array.isArray(s.flag_reasons) ? s.flag_reasons : [],
     metrics: Array.isArray(s.metrics)
       ? s.metrics
-          .filter((m: any) => safeNum(m?.score_contribution) > 0)
-          .map((m: any) => ({
+          .filter((m) => safeNum(m?.score_contribution) > 0)
+          .map((m) => ({
             metric_id: String(m?.metric_id ?? ""),
             value: m?.value === null ? null : safeNum(m?.value),
             unit: String(m?.unit ?? ""),
@@ -124,7 +141,7 @@ ${JSON.stringify(payload)}
 
   const raw = stripCodeFences(text);
 
-  let parsed: any;
+  let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
   } catch {
@@ -137,16 +154,34 @@ ${JSON.stringify(payload)}
     }
   }
 
-  const suppliers = Array.isArray(parsed?.suppliers) ? parsed.suppliers : [];
+  const parsedObj = (parsed ?? {}) as {
+    report_date?: string;
+    suppliers_reviewed?: number;
+    suppliers?: Array<{
+      table_name?: string;
+      supplier_key?: string;
+      supplier_name?: string;
+      report_date?: string;
+      metrics?: Array<{
+        metric_id?: string;
+        value?: number | null;
+        unit?: string;
+      }>;
+      trigger_reason?: string;
+      overall_risk_score?: number;
+    }>;
+  };
+
+  const suppliers = Array.isArray(parsedObj.suppliers) ? parsedObj.suppliers : [];
 
   const report: RiskReportOutput = {
-    report_date: String(parsed?.report_date ?? reportDate),
-    suppliers_reviewed: safeNum(parsed?.suppliers_reviewed ?? payload.length),
-    suppliers: suppliers.map((x: any, idx: number) => {
-      const inputSupplier = payload[idx];
+    report_date: String(parsedObj.report_date ?? reportDate),
+    suppliers_reviewed: safeNum(parsedObj.suppliers_reviewed ?? payload.length),
+    suppliers: suppliers.map((x, idx) => {
+      const inputSupplier: InputSupplierForLLM | undefined = payload[idx];
 
-      const metrics = Array.isArray(x?.metrics)
-        ? x.metrics.map((m: any) => ({
+      const metrics: FinalMetricEntry[] = Array.isArray(x?.metrics)
+        ? x.metrics.map((m) => ({
             metric_id: String(m?.metric_id ?? ""),
             value: m?.value === null ? null : safeNum(m?.value),
             unit: String(m?.unit ?? ""),
@@ -154,12 +189,12 @@ ${JSON.stringify(payload)}
         : [];
 
       const filteredMetrics = metrics.filter((m) =>
-        inputSupplier?.metrics?.some((im: any) => im.metric_id === m.metric_id)
+        inputSupplier?.metrics?.some((im: { metric_id: string }) => im.metric_id === m.metric_id)
       );
 
       const fallbackTriggerReason = dedupeStrings([
         ...(inputSupplier?.trigger_reasons ?? []),
-        `This supplier shows risk signals requiring review based on the triggered metrics above.`,
+        "This supplier shows risk signals requiring review based on the triggered metrics above.",
       ]).join(" ");
 
       return {
@@ -173,9 +208,7 @@ ${JSON.stringify(payload)}
           1,
           Math.min(
             10,
-            Math.round(
-              safeNum(x?.overall_risk_score ?? inputSupplier?.overall_risk_score ?? 5)
-            )
+            Math.round(safeNum(x?.overall_risk_score ?? inputSupplier?.overall_risk_score ?? 5))
           )
         ),
       };
