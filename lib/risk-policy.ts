@@ -1,20 +1,42 @@
 // lib/risk-policy.ts
 
-export const RISK_POLICY_VERSION = "v2.0.0";
+export const RISK_POLICY_VERSION = "v3.0.0";
 
 export const RISK_THRESHOLDS = {
-  receivableWowPct: { low: 50, high: 200 },
-  liabilityWowPct: { low: 50, high: 200 },
+  receivableAnomaly: {
+    wowLow: 50,
+    wowHigh: 100,
+    wowCritical: 200,
 
-  marketplacePaymentDropPct: {
-    low: -50,
-    high: -80,
+    histLow: 2.0,
+    histHigh: 4.0,
+    histCritical: 8.0,
   },
 
-  chargebackRatio: {
-    low: 0.6,
-    high: 1.0,
-    critical: 1.8,
+  liabilityAnomaly: {
+    wowLow: 50,
+    wowHigh: 100,
+    wowCritical: 200,
+
+    histLow: 1.5,
+    histHigh: 2.8,
+    histCritical: 4.2,
+  },
+
+  chargebackAnomaly: {
+    ratioLow: 0.6,
+    ratioHigh: 1.0,
+    ratioCritical: 1.8,
+
+    histLow: 2.0,
+    histHigh: 4.5,
+    histCritical: 10.0,
+  },
+
+  marketplacePaymentDelayDays: {
+    low: 14,
+    high: 21,
+    critical: 28,
   },
 
   negativeNetEarning: {
@@ -27,10 +49,6 @@ export const RISK_THRESHOLDS = {
     medium: -500,
     high: -2_000,
     critical: -7_000,
-  },
-
-  outstandingExposure: {
-    high: 500_000,
   },
 
   dueFromSupplierPct: {
@@ -47,14 +65,13 @@ export const RISK_THRESHOLDS = {
 } as const;
 
 export const RISK_WEIGHTS = {
-  receivableSpike: 8,
-  liabilitySpike: 10,
-  marketplacePaymentDrop: 10,
-  chargebackRatio: 18,
+  receivableAnomaly: 8,
+  liabilityAnomaly: 10,
+  marketplacePaymentDelay: 12,
+  chargebackAnomaly: 18,
   negativeNetEarning: 15,
   negativeAvailableBalance: 20,
   dueFromSupplierPositive: 19,
-  outstandingExposure: 5,
 } as const;
 
 export function mapEngineScore100ToRisk1to10(score: number): number {

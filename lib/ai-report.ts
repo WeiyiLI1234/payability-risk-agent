@@ -23,7 +23,7 @@ export type SupplierRiskReport = {
   recommended_actions: string[];
   engine_score_100: number;
   engine_suggested_risk_score: number;
-  overall_risk_score: number; // final LLM score, 1-10
+  overall_risk_score: number;
 };
 
 export type RiskReportOutput = {
@@ -62,19 +62,18 @@ export async function generateRiskReportJSON(
     engine_suggested_risk_score: safeNum(s.engine_suggested_risk_score),
 
     receivable: safeNum(s.today_receivable),
+    liability: safeNum(s.today_liability),
     chargeback: safeNum(s.today_chargeback),
     computed_net_earning: safeNum(s.today_net_earning),
     available_balance: safeNum(s.today_available_balance),
     outstanding_balance: safeNum(s.today_outstanding_bal),
 
-    receivable_wow_pct: s.receivable_change_pct ?? null,
-    liability_wow_pct: s.liability_change_pct ?? null,
-    marketplace_payment_change_pct: s.marketplace_payment_change_pct ?? null,
-    chargeback_ratio: s.chargeback_ratio ?? null,
-
     due_from_supplier: safeNum(s.today_due_from_supplier ?? 0),
     due_from_supplier_ratio: s.due_from_supplier_ratio ?? null,
     due_from_supplier_turned_positive: !!s.due_from_supplier_turned_positive,
+
+    days_since_last_marketplace_payment:
+      s.days_since_last_marketplace_payment ?? null,
 
     flag_reasons: Array.isArray(s.flag_reasons) ? s.flag_reasons : [],
     metrics: Array.isArray(s.metrics) ? s.metrics : [],
@@ -85,22 +84,22 @@ You are a senior financial risk analyst at Payability.
 You MUST output valid JSON and NOTHING else.
 
 Your job:
-- Review each supplier's engine-generated risk signals and raw values.
+- Review each supplier's engine-generated signals and raw values.
 - Assign a FINAL overall_risk_score from 1 to 10, where 1 is lowest risk and 10 is highest risk.
-- Provide deep interpretation of why the supplier is risky or why the risk is manageable.
+- Provide deep interpretation of the real risk drivers.
 
 Important scoring policy:
 - Start from engine_suggested_risk_score.
 - You may adjust by at most 2 points up or down.
-- Do NOT over-penalize pure growth in receivables if repayment quality remains healthy.
-- Put heavier emphasis on:
-  1) due_from_supplier becoming positive
-  2) negative available balance
-  3) negative net earning
-  4) high chargeback ratio
-  5) materially worsening liabilities
-  6) meaningful drop in marketplace payments when that data is available
-- If due_from_supplier turned positive OR available_balance is materially negative OR chargeback_ratio is extreme, the final score should usually be at least 7 unless there is strong offsetting evidence.
+- Place heaviest emphasis on:
+  1) due_from_supplier turning positive
+  2) materially negative available balance
+  3) sustained negative net earning
+  4) chargeback anomaly
+  5) payment delay beyond expected cadence
+  6) liability anomaly
+- Receivable anomaly alone should not drive the score too high unless there are repayment or balance-quality concerns.
+- Outstanding exposure is contextual and should affect prioritization, not the base risk score by itself.
 
 Output JSON only.
 `.trim();
@@ -153,8 +152,7 @@ Rules:
 - total_exposure = sum of all outstanding_balance values
 - Keep metrics aligned with input metrics; do not invent new numeric values
 - trigger_reasons should be concise and specific
-- deep_interpretation should be thoughtful and not just restate the numbers
-- recommended_actions should be practical for a risk operations team
+- deep_interpretation should explain the business meaning of the signals, not just restate numbers
 
 Input suppliers:
 ${JSON.stringify(payload)}

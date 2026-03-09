@@ -1,3 +1,5 @@
+// lib/bigquery.ts
+
 import { BigQuery } from "@google-cloud/bigquery";
 
 function getBigQueryClient() {
@@ -13,9 +15,47 @@ function getBigQueryClient() {
 
 const bigquery = getBigQueryClient();
 
-export async function getDailyChangeData() {
+/**
+ * 增量入口：
+ * 找出最近 N 天有新记录的 supplier。
+ * 真正上生产时，最好改成基于 state table 的 last_run_time / max(latest_record_date)。
+ */
+export async function getChangedSupplierKeys(daysBack = 2): Promise<string[]> {
   const query = `
-    WITH base AS (
+    SELECT DISTINCT supplier_key
+    FROM \`bigqueryexport-183608.PayabilitySheets.vm_transaction_summary\`
+    WHERE xact_post_date >= DATE_SUB(CURRENT_DATE(), INTERVAL @days_back DAY)
+      AND xact_post_date <= CURRENT_DATE()
+      AND supplier_key IS NOT NULL
+  `;
+
+  const [rows] = await bigquery.query({
+    query,
+    params: { days_back: daysBack },
+  });
+
+  return (rows as Array<{ supplier_key: string }>).map((r) => r.supplier_key);
+}
+
+type GetSupplierRiskInputOptions = {
+  supplierKeys?: string[];
+  limit?: number;
+};
+
+export async function getSupplierRiskInputData(
+  options: GetSupplierRiskInputOptions = {}
+) {
+  const supplierKeys = options.supplierKeys ?? [];
+  const limit = options.limit ?? 2000;
+  const useSupplierFilter = supplierKeys.length > 0;
+
+  const query = `
+    WITH target_suppliers AS (
+      SELECT supplier_key
+      FROM UNNEST(@supplier_keys) AS supplier_key
+    ),
+
+    base AS (
       SELECT
         supplier_key,
         supplier_name,
@@ -31,6 +71,10 @@ export async function getDailyChangeData() {
         IFNULL(due_from_supplier, 0) AS due_from_supplier
       FROM \`bigqueryexport-183608.PayabilitySheets.vm_transaction_summary\`
       WHERE xact_post_date <= CURRENT_DATE()
+        AND (
+          @use_supplier_filter = FALSE
+          OR supplier_key IN (SELECT supplier_key FROM target_suppliers)
+        )
     ),
 
     supplier_history AS (
@@ -87,12 +131,10 @@ export async function getDailyChangeData() {
     trailing_medians AS (
       SELECT
         supplier_key,
-
         APPROX_QUANTILES(receivable, 100)[OFFSET(50)] AS trailing_median_receivable,
         APPROX_QUANTILES(liability, 100)[OFFSET(50)] AS trailing_median_liability,
         APPROX_QUANTILES(marketplace_payment, 100)[OFFSET(50)] AS trailing_median_marketplace_payment,
         APPROX_QUANTILES(chargeback, 100)[OFFSET(50)] AS trailing_median_chargeback
-
       FROM trailing_6
       WHERE hist_rn BETWEEN 2 AND 7
       GROUP BY supplier_key
@@ -124,12 +166,10 @@ export async function getDailyChangeData() {
         supplier_key,
         xact_post_date,
         marketplace_payment,
-
         LAG(xact_post_date) OVER (
           PARTITION BY supplier_key
           ORDER BY xact_post_date
         ) AS prev_payment_date,
-
         ROW_NUMBER() OVER (
           PARTITION BY supplier_key
           ORDER BY xact_post_date DESC
@@ -221,21 +261,7 @@ export async function getDailyChangeData() {
       ns.negative_net_earning_streak,
 
       DATE_DIFF(CURRENT_DATE(), lp.last_marketplace_payment_date, DAY) AS days_since_last_marketplace_payment,
-      pgs.historical_median_payment_gap_days,
-
-      CASE
-        WHEN pgs.historical_median_payment_gap_days IS NULL
-          OR pgs.historical_median_payment_gap_days = 0
-          OR lp.last_marketplace_payment_date IS NULL
-        THEN NULL
-        ELSE ROUND(
-          SAFE_DIVIDE(
-            DATE_DIFF(CURRENT_DATE(), lp.last_marketplace_payment_date, DAY),
-            pgs.historical_median_payment_gap_days
-          ),
-          2
-        )
-      END AS marketplace_payment_gap_ratio
+      pgs.historical_median_payment_gap_days
 
     FROM latest_row l
     LEFT JOIN trailing_medians tm
@@ -248,9 +274,25 @@ export async function getDailyChangeData() {
       ON l.supplier_key = pgs.supplier_key
 
     ORDER BY l.outstanding_bal DESC
-    LIMIT 2000
+    LIMIT @limit
   `;
 
-  const [rows] = await bigquery.query({ query });
+  const [rows] = await bigquery.query({
+    query,
+    params: {
+      supplier_keys: supplierKeys,
+      use_supplier_filter: useSupplierFilter,
+      limit,
+    },
+  });
+
   return rows;
+}
+
+/**
+ * 兼容旧调用。
+ * 若不传 supplierKeys，则拉全量最新状态。
+ */
+export async function getDailyChangeData() {
+  return getSupplierRiskInputData();
 }

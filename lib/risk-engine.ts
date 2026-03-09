@@ -44,23 +44,18 @@ export type DailyChangeRow = {
 
   days_since_last_marketplace_payment?: number | null;
   historical_median_payment_gap_days?: number | null;
-  marketplace_payment_gap_ratio?: number | null;
 };
 
 export type MetricResult = {
   metric_id:
-    | "RECEIVABLE_WOW_CHANGE"
-    | "RECEIVABLE_VS_HISTORY"
-    | "LIABILITY_WOW_CHANGE"
-    | "LIABILITY_VS_HISTORY"
-    | "MARKETPLACE_PAYMENT_CHANGE"
-    | "MARKETPLACE_PAYMENT_GAP"
-    | "CHARGEBACK_RATIO"
-    | "CHARGEBACK_VS_HISTORY"
+    | "RECEIVABLE_ANOMALY"
+    | "LIABILITY_ANOMALY"
+    | "MARKETPLACE_PAYMENT_DELAY"
+    | "CHARGEBACK_ANOMALY"
     | "NET_EARNING"
     | "AVAILABLE_BALANCE"
-    | "OUTSTANDING_EXPOSURE"
-    | "DUE_FROM_SUPPLIER";
+    | "DUE_FROM_SUPPLIER"
+    | "OUTSTANDING_EXPOSURE";
   value: number | null;
   unit: string;
   explanation: string;
@@ -72,8 +67,7 @@ export type MetricResult = {
 export type FlaggedSupplier = DailyChangeRow & {
   receivable_flagged: boolean;
   liability_flagged: boolean;
-  marketplace_payment_flagged: boolean;
-  marketplace_payment_gap_flagged: boolean;
+  marketplace_payment_delay_flagged: boolean;
   net_earning_flagged: boolean;
   available_balance_flagged: boolean;
   due_from_supplier_flagged: boolean;
@@ -81,7 +75,6 @@ export type FlaggedSupplier = DailyChangeRow & {
 
   receivable_vs_history_ratio: number | null;
   liability_vs_history_ratio: number | null;
-  marketplace_payment_vs_history_ratio: number | null;
   chargeback_vs_history_ratio: number | null;
   chargeback_ratio: number | null;
   due_from_supplier_ratio: number | null;
@@ -91,7 +84,7 @@ export type FlaggedSupplier = DailyChangeRow & {
   flag_reasons: string[];
 
   engine_score_100: number;
-  engine_suggested_risk_score: number; // 1-10
+  engine_suggested_risk_score: number;
   policy_version: string;
 };
 
@@ -156,20 +149,6 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
       r.receivable_change_pct === null ? null : safeNum(r.receivable_change_pct);
     const liabilityPct =
       r.liability_change_pct === null ? null : safeNum(r.liability_change_pct);
-    const marketplacePaymentChangePct =
-      r.marketplace_payment_change_pct === null || r.marketplace_payment_change_pct === undefined
-        ? null
-        : safeNum(r.marketplace_payment_change_pct);
-
-    const todayMarketplacePayment =
-      r.today_marketplace_payment === null || r.today_marketplace_payment === undefined
-        ? null
-        : safeNum(r.today_marketplace_payment);
-
-    const prevMarketplacePayment =
-      r.prev_marketplace_payment === null || r.prev_marketplace_payment === undefined
-        ? null
-        : safeNum(r.prev_marketplace_payment);
 
     const todayDueFromSupplier =
       r.today_due_from_supplier === null || r.today_due_from_supplier === undefined
@@ -191,12 +170,6 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
         ? null
         : safeNum(r.trailing_median_liability);
 
-    const trailingMedianMarketplacePayment =
-      r.trailing_median_marketplace_payment === null ||
-      r.trailing_median_marketplace_payment === undefined
-        ? null
-        : safeNum(r.trailing_median_marketplace_payment);
-
     const trailingMedianChargeback =
       r.trailing_median_chargeback === null || r.trailing_median_chargeback === undefined
         ? null
@@ -213,23 +186,8 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
         ? null
         : safeNum(r.days_since_last_marketplace_payment);
 
-    const historicalMedianPaymentGapDays =
-      r.historical_median_payment_gap_days === null ||
-      r.historical_median_payment_gap_days === undefined
-        ? null
-        : safeNum(r.historical_median_payment_gap_days);
-
-    const marketplacePaymentGapRatio =
-      r.marketplace_payment_gap_ratio === null || r.marketplace_payment_gap_ratio === undefined
-        ? null
-        : safeNum(r.marketplace_payment_gap_ratio);
-
     const receivableVsHistoryRatio = safeRatio(todayReceivable, trailingMedianReceivable ?? 0);
     const liabilityVsHistoryRatio = safeRatio(todayLiability, trailingMedianLiability ?? 0);
-    const marketplacePaymentVsHistoryRatio = safeRatio(
-      todayMarketplacePayment ?? 0,
-      trailingMedianMarketplacePayment ?? 0
-    );
     const chargebackVsHistoryRatio = safeRatio(todayChargeback, trailingMedianChargeback ?? 0);
 
     const dueFromSupplierRatio = safeRatio(todayDueFromSupplier, outstandingBal);
@@ -237,11 +195,12 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
     const chargebackRatio = safeRatio(todayChargeback, todayReceivable);
 
     // -------------------------
-    // 1) Receivable WoW change
+    // 1) RECEIVABLE_ANOMALY
+    // gate = WoW + vs_history + absolute materiality
     // -------------------------
     const receivableBase = baseAbs(todayReceivable, prevReceivable);
     const receivableDelta = Math.abs(todayReceivable - (prevReceivable ?? 0));
-    const receivableMaterial =
+    const receivableAbsMaterial =
       receivableBase >= RISK_THRESHOLDS.materiality.minBaseReceivable &&
       receivableDelta >= RISK_THRESHOLDS.materiality.minAbsDeltaReceivable;
 
@@ -251,89 +210,68 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
 
     if (
       receivablePct !== null &&
-      receivableMaterial &&
-      Math.abs(receivablePct) >= RISK_THRESHOLDS.receivableWowPct.high
+      receivableVsHistoryRatio !== null &&
+      receivableAbsMaterial &&
+      Math.abs(receivablePct) >= RISK_THRESHOLDS.receivableAnomaly.wowCritical &&
+      receivableVsHistoryRatio >= RISK_THRESHOLDS.receivableAnomaly.histCritical
     ) {
       receivable_flagged = true;
-      receivableSeverity = "HIGH";
-      receivableScore = Math.round(RISK_WEIGHTS.receivableSpike * 0.7);
+      receivableSeverity = "CRITICAL";
+      receivableScore = Math.round(RISK_WEIGHTS.receivableAnomaly * 0.9);
       reasons.push(
-        `Receivables moved sharply by ${fmtPct(receivablePct)} from ${fmtMoney(prevReceivable ?? 0)} to ${fmtMoney(todayReceivable)}.`
+        `Receivable anomaly is severe: WoW change ${fmtPct(receivablePct)} and current level is ${receivableVsHistoryRatio.toFixed(2)}x trailing median.`
       );
     } else if (
       receivablePct !== null &&
-      receivableMaterial &&
-      Math.abs(receivablePct) >= RISK_THRESHOLDS.receivableWowPct.low
+      receivableVsHistoryRatio !== null &&
+      receivableAbsMaterial &&
+      Math.abs(receivablePct) >= RISK_THRESHOLDS.receivableAnomaly.wowHigh &&
+      receivableVsHistoryRatio >= RISK_THRESHOLDS.receivableAnomaly.histHigh
+    ) {
+      receivable_flagged = true;
+      receivableSeverity = "HIGH";
+      receivableScore = Math.round(RISK_WEIGHTS.receivableAnomaly * 0.7);
+      reasons.push(
+        `Receivable anomaly is material: WoW change ${fmtPct(receivablePct)} and current level is ${receivableVsHistoryRatio.toFixed(2)}x trailing median.`
+      );
+    } else if (
+      receivablePct !== null &&
+      receivableVsHistoryRatio !== null &&
+      receivableAbsMaterial &&
+      Math.abs(receivablePct) >= RISK_THRESHOLDS.receivableAnomaly.wowLow &&
+      receivableVsHistoryRatio >= RISK_THRESHOLDS.receivableAnomaly.histLow
     ) {
       receivable_flagged = true;
       receivableSeverity = "MEDIUM";
-      receivableScore = Math.round(RISK_WEIGHTS.receivableSpike * 0.4);
-      reasons.push(`Receivables showed a material change of ${fmtPct(receivablePct)} versus the prior record.`);
+      receivableScore = Math.round(RISK_WEIGHTS.receivableAnomaly * 0.45);
+      reasons.push(
+        `Receivables moved ${fmtPct(receivablePct)} and are ${receivableVsHistoryRatio.toFixed(2)}x trailing median, indicating a material change.`
+      );
     }
 
     engineScore += receivableScore;
     metrics.push({
-      metric_id: "RECEIVABLE_WOW_CHANGE",
+      metric_id: "RECEIVABLE_ANOMALY",
       value: receivablePct,
       unit: "%",
       explanation:
         receivablePct === null
-          ? "No prior receivable record is available for comparison."
-          : `Receivables moved from ${fmtMoney(prevReceivable ?? 0)} to ${fmtMoney(todayReceivable)}, a ${fmtPct(receivablePct)} change.`,
+          ? "Receivable anomaly cannot be assessed because prior record is unavailable."
+          : receivableVsHistoryRatio === null
+          ? `Receivables changed by ${fmtPct(receivablePct)}, but historical materiality baseline is unavailable.`
+          : `Receivables changed by ${fmtPct(receivablePct)} and current level is ${receivableVsHistoryRatio.toFixed(2)}x trailing median.`,
       severity: receivableSeverity,
       score_contribution: receivableScore,
       triggered: receivable_flagged,
     });
 
     // -------------------------
-    // 2) Receivable vs history
-    // -------------------------
-    let receivableVsHistorySeverity: MetricResult["severity"] = "NONE";
-    let receivableVsHistoryScore = 0;
-
-    if (receivableVsHistoryRatio !== null && receivableVsHistoryRatio > 8) {
-      receivableVsHistorySeverity = "CRITICAL";
-      receivableVsHistoryScore = Math.round(RISK_WEIGHTS.receivableSpike * 0.9);
-      receivable_flagged = true;
-      reasons.push(
-        `Receivables are ${receivableVsHistoryRatio.toFixed(2)}x the trailing historical median, indicating an anomalous spike.`
-      );
-    } else if (receivableVsHistoryRatio !== null && receivableVsHistoryRatio > 4) {
-      receivableVsHistorySeverity = "HIGH";
-      receivableVsHistoryScore = Math.round(RISK_WEIGHTS.receivableSpike * 0.7);
-      receivable_flagged = true;
-      reasons.push(
-        `Receivables are elevated at ${receivableVsHistoryRatio.toFixed(2)}x the trailing historical median.`
-      );
-    } else if (receivableVsHistoryRatio !== null && receivableVsHistoryRatio > 2) {
-      receivableVsHistorySeverity = "MEDIUM";
-      receivableVsHistoryScore = Math.round(RISK_WEIGHTS.receivableSpike * 0.4);
-      receivable_flagged = true;
-      reasons.push(
-        `Receivables are above normal history at ${receivableVsHistoryRatio.toFixed(2)}x the trailing median.`
-      );
-    }
-
-    engineScore += receivableVsHistoryScore;
-    metrics.push({
-      metric_id: "RECEIVABLE_VS_HISTORY",
-      value: receivableVsHistoryRatio,
-      unit: "ratio",
-      explanation:
-        receivableVsHistoryRatio === null
-          ? "Historical receivable baseline is unavailable."
-          : `Current receivable is ${receivableVsHistoryRatio.toFixed(2)}x the trailing median.`,
-      severity: receivableVsHistorySeverity,
-      score_contribution: receivableVsHistoryScore,
-      triggered: receivableVsHistoryScore > 0,
-    });
-
-    // -------------------------
-    // 3) Liability WoW change
+    // 2) LIABILITY_ANOMALY
+    // gate = WoW + vs_history + absolute materiality
     // -------------------------
     const liabilityBase = baseAbs(todayLiability, prevLiability);
     const liabilityDelta = Math.abs(todayLiability - (prevLiability ?? 0));
-    const liabilityMaterial =
+    const liabilityAbsMaterial =
       liabilityBase >= RISK_THRESHOLDS.materiality.minBaseLiability &&
       liabilityDelta >= RISK_THRESHOLDS.materiality.minAbsDeltaLiability;
 
@@ -343,289 +281,179 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
 
     if (
       liabilityPct !== null &&
-      liabilityMaterial &&
-      Math.abs(liabilityPct) >= RISK_THRESHOLDS.liabilityWowPct.high
+      liabilityVsHistoryRatio !== null &&
+      liabilityAbsMaterial &&
+      Math.abs(liabilityPct) >= RISK_THRESHOLDS.liabilityAnomaly.wowCritical &&
+      liabilityVsHistoryRatio >= RISK_THRESHOLDS.liabilityAnomaly.histCritical
     ) {
       liability_flagged = true;
-      liabilitySeverity = "HIGH";
-      liabilityScore = Math.round(RISK_WEIGHTS.liabilitySpike * 0.7);
+      liabilitySeverity = "CRITICAL";
+      liabilityScore = Math.round(RISK_WEIGHTS.liabilityAnomaly * 0.9);
       reasons.push(
-        `Liabilities moved sharply by ${fmtPct(liabilityPct)} from ${fmtMoney(prevLiability ?? 0)} to ${fmtMoney(todayLiability)}.`
+        `Liability anomaly is severe: change ${fmtPct(liabilityPct)} and current level is ${liabilityVsHistoryRatio.toFixed(2)}x trailing median.`
       );
     } else if (
       liabilityPct !== null &&
-      liabilityMaterial &&
-      Math.abs(liabilityPct) >= RISK_THRESHOLDS.liabilityWowPct.low
+      liabilityVsHistoryRatio !== null &&
+      liabilityAbsMaterial &&
+      Math.abs(liabilityPct) >= RISK_THRESHOLDS.liabilityAnomaly.wowHigh &&
+      liabilityVsHistoryRatio >= RISK_THRESHOLDS.liabilityAnomaly.histHigh
+    ) {
+      liability_flagged = true;
+      liabilitySeverity = "HIGH";
+      liabilityScore = Math.round(RISK_WEIGHTS.liabilityAnomaly * 0.7);
+      reasons.push(
+        `Liability anomaly is material: change ${fmtPct(liabilityPct)} and current level is ${liabilityVsHistoryRatio.toFixed(2)}x trailing median.`
+      );
+    } else if (
+      liabilityPct !== null &&
+      liabilityVsHistoryRatio !== null &&
+      liabilityAbsMaterial &&
+      Math.abs(liabilityPct) >= RISK_THRESHOLDS.liabilityAnomaly.wowLow &&
+      liabilityVsHistoryRatio >= RISK_THRESHOLDS.liabilityAnomaly.histLow
     ) {
       liability_flagged = true;
       liabilitySeverity = "MEDIUM";
-      liabilityScore = Math.round(RISK_WEIGHTS.liabilitySpike * 0.4);
-      reasons.push(`Liabilities showed a material change of ${fmtPct(liabilityPct)} versus the prior record.`);
+      liabilityScore = Math.round(RISK_WEIGHTS.liabilityAnomaly * 0.45);
+      reasons.push(
+        `Liabilities moved ${fmtPct(liabilityPct)} and are ${liabilityVsHistoryRatio.toFixed(2)}x trailing median.`
+      );
     }
 
     engineScore += liabilityScore;
     metrics.push({
-      metric_id: "LIABILITY_WOW_CHANGE",
+      metric_id: "LIABILITY_ANOMALY",
       value: liabilityPct,
       unit: "%",
       explanation:
         liabilityPct === null
-          ? "No prior liability record is available for comparison."
-          : `Liabilities moved from ${fmtMoney(prevLiability ?? 0)} to ${fmtMoney(todayLiability)}, a ${fmtPct(liabilityPct)} change.`,
+          ? "Liability anomaly cannot be assessed because prior record is unavailable."
+          : liabilityVsHistoryRatio === null
+          ? `Liabilities changed by ${fmtPct(liabilityPct)}, but historical materiality baseline is unavailable.`
+          : `Liabilities changed by ${fmtPct(liabilityPct)} and current level is ${liabilityVsHistoryRatio.toFixed(2)}x trailing median.`,
       severity: liabilitySeverity,
       score_contribution: liabilityScore,
       triggered: liability_flagged,
     });
 
     // -------------------------
-    // 4) Liability vs history
+    // 3) MARKETPLACE_PAYMENT_DELAY
+    // 只看 delay，不看金额
     // -------------------------
-    let liabilityVsHistorySeverity: MetricResult["severity"] = "NONE";
-    let liabilityVsHistoryScore = 0;
-
-    if (liabilityVsHistoryRatio !== null && liabilityVsHistoryRatio > 4.2) {
-      liabilityVsHistorySeverity = "CRITICAL";
-      liabilityVsHistoryScore = Math.round(RISK_WEIGHTS.liabilitySpike * 0.9);
-      liability_flagged = true;
-      reasons.push(
-        `Liabilities are ${liabilityVsHistoryRatio.toFixed(2)}x the trailing historical median, indicating a sharp increase in risk burden.`
-      );
-    } else if (liabilityVsHistoryRatio !== null && liabilityVsHistoryRatio > 2.8) {
-      liabilityVsHistorySeverity = "HIGH";
-      liabilityVsHistoryScore = Math.round(RISK_WEIGHTS.liabilitySpike * 0.7);
-      liability_flagged = true;
-      reasons.push(
-        `Liabilities are elevated at ${liabilityVsHistoryRatio.toFixed(2)}x the trailing historical median.`
-      );
-    } else if (liabilityVsHistoryRatio !== null && liabilityVsHistoryRatio > 1.5) {
-      liabilityVsHistorySeverity = "MEDIUM";
-      liabilityVsHistoryScore = Math.round(RISK_WEIGHTS.liabilitySpike * 0.4);
-      liability_flagged = true;
-      reasons.push(
-        `Liabilities are above normal history at ${liabilityVsHistoryRatio.toFixed(2)}x the trailing median.`
-      );
-    }
-
-    engineScore += liabilityVsHistoryScore;
-    metrics.push({
-      metric_id: "LIABILITY_VS_HISTORY",
-      value: liabilityVsHistoryRatio,
-      unit: "ratio",
-      explanation:
-        liabilityVsHistoryRatio === null
-          ? "Historical liability baseline is unavailable."
-          : `Current liability is ${liabilityVsHistoryRatio.toFixed(2)}x the trailing median.`,
-      severity: liabilityVsHistorySeverity,
-      score_contribution: liabilityVsHistoryScore,
-      triggered: liabilityVsHistoryScore > 0,
-    });
-
-    // -------------------------
-    // 5) Marketplace payment amount deterioration
-    // -------------------------
-    let marketplace_payment_flagged = false;
-    let marketplacePaymentSeverity: MetricResult["severity"] = "NONE";
-    let marketplacePaymentScore = 0;
+    let marketplace_payment_delay_flagged = false;
+    let paymentDelaySeverity: MetricResult["severity"] = "NONE";
+    let paymentDelayScore = 0;
 
     if (
-      marketplacePaymentChangePct !== null &&
-      marketplacePaymentChangePct <= RISK_THRESHOLDS.marketplacePaymentDropPct.high
+      daysSinceLastMarketplacePayment !== null &&
+      daysSinceLastMarketplacePayment > RISK_THRESHOLDS.marketplacePaymentDelayDays.critical
     ) {
-      marketplace_payment_flagged = true;
-      marketplacePaymentSeverity = "HIGH";
-      marketplacePaymentScore = Math.round(RISK_WEIGHTS.marketplacePaymentDrop * 0.7);
+      marketplace_payment_delay_flagged = true;
+      paymentDelaySeverity = "CRITICAL";
+      paymentDelayScore = RISK_WEIGHTS.marketplacePaymentDelay;
       reasons.push(
-        `Marketplace payment dropped materially by ${fmtPct(marketplacePaymentChangePct)} from ${fmtMoney(prevMarketplacePayment ?? 0)} to ${fmtMoney(todayMarketplacePayment ?? 0)}.`
+        `Marketplace payment appears severely delayed at ${daysSinceLastMarketplacePayment} days since the last positive payment.`
       );
     } else if (
-      marketplacePaymentChangePct !== null &&
-      marketplacePaymentChangePct <= RISK_THRESHOLDS.marketplacePaymentDropPct.low
+      daysSinceLastMarketplacePayment !== null &&
+      daysSinceLastMarketplacePayment > RISK_THRESHOLDS.marketplacePaymentDelayDays.high
     ) {
-      marketplace_payment_flagged = true;
-      marketplacePaymentSeverity = "MEDIUM";
-      marketplacePaymentScore = Math.round(RISK_WEIGHTS.marketplacePaymentDrop * 0.45);
-      reasons.push(`Marketplace payment decreased by ${fmtPct(marketplacePaymentChangePct)} versus the prior record.`);
+      marketplace_payment_delay_flagged = true;
+      paymentDelaySeverity = "HIGH";
+      paymentDelayScore = Math.round(RISK_WEIGHTS.marketplacePaymentDelay * 0.7);
+      reasons.push(
+        `Marketplace payment delay is elevated at ${daysSinceLastMarketplacePayment} days since the last positive payment.`
+      );
+    } else if (
+      daysSinceLastMarketplacePayment !== null &&
+      daysSinceLastMarketplacePayment > RISK_THRESHOLDS.marketplacePaymentDelayDays.low
+    ) {
+      marketplace_payment_delay_flagged = true;
+      paymentDelaySeverity = "MEDIUM";
+      paymentDelayScore = Math.round(RISK_WEIGHTS.marketplacePaymentDelay * 0.45);
+      reasons.push(
+        `Marketplace payment has not arrived for ${daysSinceLastMarketplacePayment} days, exceeding the expected two-week cadence.`
+      );
     }
 
-    if (
-      marketplacePaymentVsHistoryRatio !== null &&
-      trailingMedianMarketplacePayment !== null &&
-      trailingMedianMarketplacePayment > 0
-    ) {
-      if (todayMarketplacePayment === 0) {
-        marketplace_payment_flagged = true;
-        marketplacePaymentSeverity = "HIGH";
-        marketplacePaymentScore = Math.max(
-          marketplacePaymentScore,
-          Math.round(RISK_WEIGHTS.marketplacePaymentDrop * 0.8)
-        );
-        reasons.push(`Marketplace payment is zero despite a positive historical payment baseline.`);
-      } else if (marketplacePaymentVsHistoryRatio < 0.2) {
-        marketplace_payment_flagged = true;
-        marketplacePaymentSeverity = "HIGH";
-        marketplacePaymentScore = Math.max(
-          marketplacePaymentScore,
-          Math.round(RISK_WEIGHTS.marketplacePaymentDrop * 0.7)
-        );
-        reasons.push(
-          `Marketplace payment is only ${(marketplacePaymentVsHistoryRatio * 100).toFixed(1)}% of its trailing historical median.`
-        );
-      } else if (marketplacePaymentVsHistoryRatio < 0.5) {
-        marketplace_payment_flagged = true;
-        marketplacePaymentSeverity = "MEDIUM";
-        marketplacePaymentScore = Math.max(
-          marketplacePaymentScore,
-          Math.round(RISK_WEIGHTS.marketplacePaymentDrop * 0.4)
-        );
-        reasons.push(
-          `Marketplace payment is materially below its trailing history at ${(marketplacePaymentVsHistoryRatio * 100).toFixed(1)}% of median.`
-        );
-      }
-    }
-
-    engineScore += marketplacePaymentScore;
+    engineScore += paymentDelayScore;
     metrics.push({
-      metric_id: "MARKETPLACE_PAYMENT_CHANGE",
-      value: marketplacePaymentChangePct,
-      unit: "%",
+      metric_id: "MARKETPLACE_PAYMENT_DELAY",
+      value: daysSinceLastMarketplacePayment,
+      unit: "days",
       explanation:
-        marketplacePaymentChangePct === null
-          ? "Marketplace payment amount trend is unavailable because prior payment data is missing or zero."
-          : `Marketplace payment changed from ${fmtMoney(prevMarketplacePayment ?? 0)} to ${fmtMoney(todayMarketplacePayment ?? 0)}, a ${fmtPct(marketplacePaymentChangePct)} move.`,
-      severity: marketplacePaymentSeverity,
-      score_contribution: marketplacePaymentScore,
-      triggered: marketplace_payment_flagged,
+        daysSinceLastMarketplacePayment === null
+          ? "Marketplace payment delay cannot be assessed because no historical positive payment was found."
+          : `It has been ${daysSinceLastMarketplacePayment} days since the last positive marketplace payment.`,
+      severity: paymentDelaySeverity,
+      score_contribution: paymentDelayScore,
+      triggered: marketplace_payment_delay_flagged,
     });
 
     // -------------------------
-    // 6) Marketplace payment frequency deterioration
-    // -------------------------
-    let marketplace_payment_gap_flagged = false;
-    let marketplacePaymentGapSeverity: MetricResult["severity"] = "NONE";
-    let marketplacePaymentGapScore = 0;
-
-    if (marketplacePaymentGapRatio !== null && marketplacePaymentGapRatio > 5) {
-      marketplace_payment_gap_flagged = true;
-      marketplacePaymentGapSeverity = "CRITICAL";
-      marketplacePaymentGapScore = RISK_WEIGHTS.marketplacePaymentDrop;
-      reasons.push(
-        `Marketplace payment cadence appears severely delayed: ${daysSinceLastMarketplacePayment} days since last payment versus a historical median gap of ${historicalMedianPaymentGapDays} days (${marketplacePaymentGapRatio.toFixed(2)}x).`
-      );
-    } else if (marketplacePaymentGapRatio !== null && marketplacePaymentGapRatio > 3) {
-      marketplace_payment_gap_flagged = true;
-      marketplacePaymentGapSeverity = "HIGH";
-      marketplacePaymentGapScore = Math.round(RISK_WEIGHTS.marketplacePaymentDrop * 0.7);
-      reasons.push(
-        `Marketplace payment cadence is materially slower than history at ${marketplacePaymentGapRatio.toFixed(2)}x normal gap.`
-      );
-    } else if (marketplacePaymentGapRatio !== null && marketplacePaymentGapRatio > 1.5) {
-      marketplace_payment_gap_flagged = true;
-      marketplacePaymentGapSeverity = "MEDIUM";
-      marketplacePaymentGapScore = Math.round(RISK_WEIGHTS.marketplacePaymentDrop * 0.4);
-      reasons.push(
-        `Marketplace payments appear slower than normal with a gap ratio of ${marketplacePaymentGapRatio.toFixed(2)}x.`
-      );
-    }
-
-    engineScore += marketplacePaymentGapScore;
-    metrics.push({
-      metric_id: "MARKETPLACE_PAYMENT_GAP",
-      value: marketplacePaymentGapRatio,
-      unit: "ratio",
-      explanation:
-        marketplacePaymentGapRatio === null
-          ? "Marketplace payment cadence baseline is unavailable."
-          : `Days since last marketplace payment is ${daysSinceLastMarketplacePayment}, versus a historical median payment gap of ${historicalMedianPaymentGapDays} days (${marketplacePaymentGapRatio.toFixed(2)}x).`,
-      severity: marketplacePaymentGapSeverity,
-      score_contribution: marketplacePaymentGapScore,
-      triggered: marketplace_payment_gap_flagged,
-    });
-
-    // -------------------------
-    // 7) Chargeback ratio
+    // 4) CHARGEBACK_ANOMALY
+    // gate = ratio + vs_history
     // -------------------------
     let chargeback_flagged = false;
     let chargebackSeverity: MetricResult["severity"] = "NONE";
     let chargebackScore = 0;
 
-    if (chargebackRatio !== null && chargebackRatio > RISK_THRESHOLDS.chargebackRatio.critical) {
+    if (
+      chargebackRatio !== null &&
+      chargebackVsHistoryRatio !== null &&
+      chargebackRatio >= RISK_THRESHOLDS.chargebackAnomaly.ratioCritical &&
+      chargebackVsHistoryRatio >= RISK_THRESHOLDS.chargebackAnomaly.histCritical
+    ) {
       chargeback_flagged = true;
       chargebackSeverity = "CRITICAL";
-      chargebackScore = Math.round(RISK_WEIGHTS.chargebackRatio * 0.9);
+      chargebackScore = Math.round(RISK_WEIGHTS.chargebackAnomaly * 0.9);
       reasons.push(
-        `Chargeback ratio is extremely high at ${chargebackRatio.toFixed(2)}x receivables (${fmtMoney(todayChargeback)} / ${fmtMoney(todayReceivable)}).`
+        `Chargeback anomaly is severe: chargeback ratio is ${chargebackRatio.toFixed(2)} and chargebacks are ${chargebackVsHistoryRatio.toFixed(2)}x trailing median.`
       );
-    } else if (chargebackRatio !== null && chargebackRatio > RISK_THRESHOLDS.chargebackRatio.high) {
+    } else if (
+      chargebackRatio !== null &&
+      chargebackVsHistoryRatio !== null &&
+      chargebackRatio >= RISK_THRESHOLDS.chargebackAnomaly.ratioHigh &&
+      chargebackVsHistoryRatio >= RISK_THRESHOLDS.chargebackAnomaly.histHigh
+    ) {
       chargeback_flagged = true;
       chargebackSeverity = "HIGH";
-      chargebackScore = Math.round(RISK_WEIGHTS.chargebackRatio * 0.7);
-      reasons.push(`Chargeback ratio is elevated at ${chargebackRatio.toFixed(2)}x receivables.`);
-    } else if (chargebackRatio !== null && chargebackRatio > RISK_THRESHOLDS.chargebackRatio.low) {
+      chargebackScore = Math.round(RISK_WEIGHTS.chargebackAnomaly * 0.7);
+      reasons.push(
+        `Chargeback anomaly is material: ratio is ${chargebackRatio.toFixed(2)} and chargebacks are ${chargebackVsHistoryRatio.toFixed(2)}x trailing median.`
+      );
+    } else if (
+      chargebackRatio !== null &&
+      chargebackVsHistoryRatio !== null &&
+      chargebackRatio >= RISK_THRESHOLDS.chargebackAnomaly.ratioLow &&
+      chargebackVsHistoryRatio >= RISK_THRESHOLDS.chargebackAnomaly.histLow
+    ) {
       chargeback_flagged = true;
       chargebackSeverity = "MEDIUM";
-      chargebackScore = Math.round(RISK_WEIGHTS.chargebackRatio * 0.4);
-      reasons.push(`Chargebacks are consuming a large share of receivables at ${chargebackRatio.toFixed(2)}x.`);
+      chargebackScore = Math.round(RISK_WEIGHTS.chargebackAnomaly * 0.45);
+      reasons.push(
+        `Chargebacks are elevated: ratio is ${chargebackRatio.toFixed(2)} and chargebacks are ${chargebackVsHistoryRatio.toFixed(2)}x trailing median.`
+      );
     }
 
     engineScore += chargebackScore;
     metrics.push({
-      metric_id: "CHARGEBACK_RATIO",
+      metric_id: "CHARGEBACK_ANOMALY",
       value: chargebackRatio,
       unit: "ratio",
       explanation:
         chargebackRatio === null
-          ? "Chargeback ratio cannot be computed because receivables are zero."
-          : `Chargeback ratio is ${chargebackRatio.toFixed(2)} based on chargebacks ${fmtMoney(todayChargeback)} and receivables ${fmtMoney(todayReceivable)}.`,
+          ? "Chargeback anomaly cannot be assessed because receivables are zero."
+          : chargebackVsHistoryRatio === null
+          ? `Chargeback ratio is ${chargebackRatio.toFixed(2)}, but historical materiality baseline is unavailable.`
+          : `Chargeback ratio is ${chargebackRatio.toFixed(2)} and chargebacks are ${chargebackVsHistoryRatio.toFixed(2)}x trailing median.`,
       severity: chargebackSeverity,
       score_contribution: chargebackScore,
       triggered: chargeback_flagged,
     });
 
     // -------------------------
-    // 8) Chargeback vs history
-    // -------------------------
-    let chargebackVsHistorySeverity: MetricResult["severity"] = "NONE";
-    let chargebackVsHistoryScore = 0;
-
-    if (chargebackVsHistoryRatio !== null && chargebackVsHistoryRatio > 10) {
-      chargeback_flagged = true;
-      chargebackVsHistorySeverity = "CRITICAL";
-      chargebackVsHistoryScore = Math.round(RISK_WEIGHTS.chargebackRatio * 0.7);
-      reasons.push(
-        `Chargebacks are ${chargebackVsHistoryRatio.toFixed(2)}x the trailing historical median.`
-      );
-    } else if (chargebackVsHistoryRatio !== null && chargebackVsHistoryRatio > 4.5) {
-      chargeback_flagged = true;
-      chargebackVsHistorySeverity = "HIGH";
-      chargebackVsHistoryScore = Math.round(RISK_WEIGHTS.chargebackRatio * 0.5);
-      reasons.push(
-        `Chargebacks are elevated at ${chargebackVsHistoryRatio.toFixed(2)}x the trailing historical median.`
-      );
-    } else if (chargebackVsHistoryRatio !== null && chargebackVsHistoryRatio > 2) {
-      chargeback_flagged = true;
-      chargebackVsHistorySeverity = "MEDIUM";
-      chargebackVsHistoryScore = Math.round(RISK_WEIGHTS.chargebackRatio * 0.3);
-      reasons.push(
-        `Chargebacks are above normal history at ${chargebackVsHistoryRatio.toFixed(2)}x the trailing median.`
-      );
-    }
-
-    engineScore += chargebackVsHistoryScore;
-    metrics.push({
-      metric_id: "CHARGEBACK_VS_HISTORY",
-      value: chargebackVsHistoryRatio,
-      unit: "ratio",
-      explanation:
-        chargebackVsHistoryRatio === null
-          ? "Historical chargeback baseline is unavailable."
-          : `Current chargeback is ${chargebackVsHistoryRatio.toFixed(2)}x the trailing median.`,
-      severity: chargebackVsHistorySeverity,
-      score_contribution: chargebackVsHistoryScore,
-      triggered: chargebackVsHistoryScore > 0,
-    });
-
-    // -------------------------
-    // 9) Negative net earning
+    // 5) NET_EARNING
     // -------------------------
     let net_earning_flagged = false;
     let netSeverity: MetricResult["severity"] = "NONE";
@@ -667,7 +495,7 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
     });
 
     // -------------------------
-    // 10) Negative available balance
+    // 6) AVAILABLE_BALANCE
     // -------------------------
     let available_balance_flagged = false;
     let availSeverity: MetricResult["severity"] = "NONE";
@@ -707,32 +535,7 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
     });
 
     // -------------------------
-    // 11) Outstanding exposure
-    // -------------------------
-    let outSeverity: MetricResult["severity"] = "NONE";
-    let outScore = 0;
-
-    if (outstandingBal > RISK_THRESHOLDS.outstandingExposure.high && engineScore > 0) {
-      outSeverity = "HIGH";
-      outScore = RISK_WEIGHTS.outstandingExposure;
-      reasons.push(
-        `Outstanding exposure is large at ${fmtMoney(outstandingBal)}, increasing the impact of other risk signals.`
-      );
-    }
-
-    engineScore += outScore;
-    metrics.push({
-      metric_id: "OUTSTANDING_EXPOSURE",
-      value: outstandingBal,
-      unit: "$",
-      explanation: `Outstanding exposure is ${fmtMoney(outstandingBal)}.`,
-      severity: outSeverity,
-      score_contribution: outScore,
-      triggered: outScore > 0,
-    });
-
-    // -------------------------
-    // 12) Due from supplier positive
+    // 7) DUE_FROM_SUPPLIER
     // -------------------------
     let due_from_supplier_flagged = false;
     let dfsSeverity: MetricResult["severity"] = "NONE";
@@ -792,13 +595,29 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
       triggered: due_from_supplier_flagged,
     });
 
+    // -------------------------
+    // 8) OUTSTANDING_EXPOSURE (context only)
+    // -------------------------
+    metrics.push({
+      metric_id: "OUTSTANDING_EXPOSURE",
+      value: outstandingBal,
+      unit: "$",
+      explanation: `Outstanding exposure is ${fmtMoney(outstandingBal)} and should be treated as contextual review information rather than a direct risk trigger.`,
+      severity: "NONE",
+      score_contribution: 0,
+      triggered: false,
+    });
+
     // hard escalation floor
     const hardTriggerCount =
       Number(dueFromSupplierTurnedPositive) +
       Number(negativeNetEarningStreak >= 3) +
       Number(todayAvail <= RISK_THRESHOLDS.negativeAvailableBalance.high) +
-      Number(chargebackRatio !== null && chargebackRatio > RISK_THRESHOLDS.chargebackRatio.critical) +
-      Number(marketplacePaymentGapRatio !== null && marketplacePaymentGapRatio > 5);
+      Number(chargebackSeverity === "CRITICAL") +
+      Number(
+        daysSinceLastMarketplacePayment !== null &&
+          daysSinceLastMarketplacePayment > RISK_THRESHOLDS.marketplacePaymentDelayDays.critical
+      );
 
     if (hardTriggerCount >= 2) {
       engineScore = Math.max(engineScore, 85);
@@ -815,8 +634,7 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
       ...r,
       receivable_flagged,
       liability_flagged,
-      marketplace_payment_flagged,
-      marketplace_payment_gap_flagged,
+      marketplace_payment_delay_flagged,
       net_earning_flagged,
       available_balance_flagged,
       due_from_supplier_flagged,
@@ -824,7 +642,6 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
 
       receivable_vs_history_ratio: receivableVsHistoryRatio,
       liability_vs_history_ratio: liabilityVsHistoryRatio,
-      marketplace_payment_vs_history_ratio: marketplacePaymentVsHistoryRatio,
       chargeback_vs_history_ratio: chargebackVsHistoryRatio,
       chargeback_ratio: chargebackRatio,
       due_from_supplier_ratio: dueFromSupplierRatio,
