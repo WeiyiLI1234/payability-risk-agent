@@ -3,13 +3,11 @@ import { BigQuery } from "@google-cloud/bigquery";
 function getBigQueryClient() {
   const projectId = process.env.GOOGLE_CLOUD_PROJECT || "bigqueryexport-183608";
 
-  // Vercel 环境：用环境变量里的凭证
   if (process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON) {
     const credentials = JSON.parse(process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON);
     return new BigQuery({ projectId, credentials });
   }
 
-  // 本地环境：自动使用 gcloud auth 的凭证
   return new BigQuery({ projectId });
 }
 
@@ -17,63 +15,239 @@ const bigquery = getBigQueryClient();
 
 export async function getDailyChangeData() {
   const query = `
-    WITH date_range AS (
+    WITH base AS (
       SELECT
-        -- ✅ latest_date is the latest date that is NOT in the future
-        MAX(IF(xact_post_date <= CURRENT_DATE(), xact_post_date, NULL)) AS latest_date,
-        DATE_SUB(MAX(IF(xact_post_date <= CURRENT_DATE(), xact_post_date, NULL)), INTERVAL 7 DAY) AS week_ago_date
+        supplier_key,
+        supplier_name,
+        xact_post_date,
+
+        IFNULL(receivable, 0) AS receivable,
+        IFNULL(potential_liability, 0) AS liability,
+        IFNULL(net_earning, 0) AS net_earning,
+        IFNULL(chargeback, 0) AS chargeback,
+        IFNULL(available_balance, 0) AS available_balance,
+        IFNULL(outstanding_bal, 0) AS outstanding_bal,
+        IFNULL(marketplace_payment, 0) AS marketplace_payment,
+        IFNULL(due_from_supplier, 0) AS due_from_supplier
       FROM \`bigqueryexport-183608.PayabilitySheets.vm_transaction_summary\`
+      WHERE xact_post_date <= CURRENT_DATE()
     ),
-    this_week AS (
+
+    supplier_history AS (
+      SELECT
+        *,
+        ROW_NUMBER() OVER (
+          PARTITION BY supplier_key
+          ORDER BY xact_post_date DESC
+        ) AS rn_desc,
+
+        LAG(receivable) OVER (
+          PARTITION BY supplier_key
+          ORDER BY xact_post_date
+        ) AS prev_receivable,
+
+        LAG(liability) OVER (
+          PARTITION BY supplier_key
+          ORDER BY xact_post_date
+        ) AS prev_liability,
+
+        LAG(marketplace_payment) OVER (
+          PARTITION BY supplier_key
+          ORDER BY xact_post_date
+        ) AS prev_marketplace_payment,
+
+        LAG(due_from_supplier) OVER (
+          PARTITION BY supplier_key
+          ORDER BY xact_post_date
+        ) AS prev_due_from_supplier
+      FROM base
+    ),
+
+    latest_row AS (
+      SELECT *
+      FROM supplier_history
+      WHERE rn_desc = 1
+    ),
+
+    trailing_6 AS (
       SELECT
         supplier_key,
-        ANY_VALUE(supplier_name) AS supplier_name,
-        SUM(IFNULL(receivable, 0)) AS current_receivable,
-        SUM(IFNULL(potential_liability, 0)) AS current_liability,
-        SUM(IFNULL(net_earning, 0)) AS current_net_earning,
-        SUM(IFNULL(chargeback, 0)) AS current_chargeback,
-        SUM(IFNULL(available_balance, 0)) AS current_available_balance,
-        SUM(IFNULL(outstanding_bal, 0)) AS current_outstanding_bal
-      FROM \`bigqueryexport-183608.PayabilitySheets.vm_transaction_summary\`, date_range
-      WHERE xact_post_date > date_range.week_ago_date
-        AND xact_post_date <= date_range.latest_date
-      GROUP BY supplier_key
+        xact_post_date,
+        receivable,
+        liability,
+        marketplace_payment,
+        chargeback,
+        ROW_NUMBER() OVER (
+          PARTITION BY supplier_key
+          ORDER BY xact_post_date DESC
+        ) AS hist_rn
+      FROM base
     ),
-    last_week AS (
+
+    trailing_medians AS (
       SELECT
         supplier_key,
-        SUM(IFNULL(receivable, 0)) AS prev_receivable,
-        SUM(IFNULL(potential_liability, 0)) AS prev_liability
-      FROM \`bigqueryexport-183608.PayabilitySheets.vm_transaction_summary\`, date_range
-      WHERE xact_post_date > DATE_SUB(date_range.week_ago_date, INTERVAL 7 DAY)
-        AND xact_post_date <= date_range.week_ago_date
+
+        APPROX_QUANTILES(receivable, 100)[OFFSET(50)] AS trailing_median_receivable,
+        APPROX_QUANTILES(liability, 100)[OFFSET(50)] AS trailing_median_liability,
+        APPROX_QUANTILES(marketplace_payment, 100)[OFFSET(50)] AS trailing_median_marketplace_payment,
+        APPROX_QUANTILES(chargeback, 100)[OFFSET(50)] AS trailing_median_chargeback
+
+      FROM trailing_6
+      WHERE hist_rn BETWEEN 2 AND 7
       GROUP BY supplier_key
+    ),
+
+    negative_streak_source AS (
+      SELECT
+        supplier_key,
+        xact_post_date,
+        net_earning,
+        ROW_NUMBER() OVER (
+          PARTITION BY supplier_key
+          ORDER BY xact_post_date DESC
+        ) AS rn
+      FROM base
+    ),
+
+    negative_net_streak AS (
+      SELECT
+        supplier_key,
+        COUNTIF(net_earning < 0) AS negative_net_earning_streak
+      FROM negative_streak_source
+      WHERE rn <= 3
+      GROUP BY supplier_key
+    ),
+
+    payment_events AS (
+      SELECT
+        supplier_key,
+        xact_post_date,
+        marketplace_payment,
+
+        LAG(xact_post_date) OVER (
+          PARTITION BY supplier_key
+          ORDER BY xact_post_date
+        ) AS prev_payment_date,
+
+        ROW_NUMBER() OVER (
+          PARTITION BY supplier_key
+          ORDER BY xact_post_date DESC
+        ) AS payment_rn_desc
+      FROM base
+      WHERE marketplace_payment > 0
+    ),
+
+    payment_gaps AS (
+      SELECT
+        supplier_key,
+        xact_post_date,
+        DATE_DIFF(xact_post_date, prev_payment_date, DAY) AS payment_gap_days
+      FROM payment_events
+      WHERE prev_payment_date IS NOT NULL
+    ),
+
+    payment_gap_stats AS (
+      SELECT
+        supplier_key,
+        APPROX_QUANTILES(payment_gap_days, 100)[OFFSET(50)] AS historical_median_payment_gap_days
+      FROM payment_gaps
+      GROUP BY supplier_key
+    ),
+
+    last_payment AS (
+      SELECT
+        supplier_key,
+        xact_post_date AS last_marketplace_payment_date
+      FROM payment_events
+      WHERE payment_rn_desc = 1
     )
+
     SELECT
-      t.supplier_key,
-      t.supplier_name,
-      t.current_receivable AS today_receivable,
-      COALESCE(l.prev_receivable, 0) AS prev_receivable,
-      t.current_liability AS today_liability,
-      COALESCE(l.prev_liability, 0) AS prev_liability,
-      t.current_net_earning AS today_net_earning,
-      t.current_chargeback AS today_chargeback,
-      t.current_available_balance AS today_available_balance,
-      t.current_outstanding_bal AS today_outstanding_bal,
+      l.supplier_key,
+      l.supplier_name,
+
+      l.receivable AS today_receivable,
+      l.prev_receivable,
+
+      l.liability AS today_liability,
+      l.prev_liability,
+
+      l.net_earning AS today_net_earning,
+      l.chargeback AS today_chargeback,
+      l.available_balance AS today_available_balance,
+      l.outstanding_bal AS today_outstanding_bal,
+
+      l.marketplace_payment AS today_marketplace_payment,
+      l.prev_marketplace_payment,
+
+      l.due_from_supplier AS today_due_from_supplier,
+      l.prev_due_from_supplier,
+
       CASE
-        WHEN COALESCE(l.prev_receivable, 0) > 0
-        THEN ROUND(SAFE_DIVIDE(t.current_receivable - l.prev_receivable, l.prev_receivable) * 100, 2)
-        ELSE NULL
+        WHEN l.prev_receivable IS NULL OR l.prev_receivable = 0 THEN NULL
+        ELSE ROUND(
+          SAFE_DIVIDE(l.receivable - l.prev_receivable, ABS(l.prev_receivable)) * 100,
+          2
+        )
       END AS receivable_change_pct,
+
       CASE
-        WHEN COALESCE(l.prev_liability, 0) > 0
-        THEN ROUND(SAFE_DIVIDE(t.current_liability - l.prev_liability, l.prev_liability) * 100, 2)
-        ELSE NULL
+        WHEN l.prev_liability IS NULL OR l.prev_liability = 0 THEN NULL
+        ELSE ROUND(
+          SAFE_DIVIDE(l.liability - l.prev_liability, ABS(l.prev_liability)) * 100,
+          2
+        )
       END AS liability_change_pct,
-      IF(l.supplier_key IS NULL, FALSE, TRUE) AS has_prev_week_data
-    FROM this_week t
-    LEFT JOIN last_week l ON t.supplier_key = l.supplier_key
-    ORDER BY t.current_receivable DESC
+
+      CASE
+        WHEN l.prev_marketplace_payment IS NULL OR l.prev_marketplace_payment = 0 THEN NULL
+        ELSE ROUND(
+          SAFE_DIVIDE(
+            l.marketplace_payment - l.prev_marketplace_payment,
+            ABS(l.prev_marketplace_payment)
+          ) * 100,
+          2
+        )
+      END AS marketplace_payment_change_pct,
+
+      IF(l.prev_receivable IS NULL, FALSE, TRUE) AS has_prev_week_data,
+
+      tm.trailing_median_receivable,
+      tm.trailing_median_liability,
+      tm.trailing_median_marketplace_payment,
+      tm.trailing_median_chargeback,
+
+      ns.negative_net_earning_streak,
+
+      DATE_DIFF(CURRENT_DATE(), lp.last_marketplace_payment_date, DAY) AS days_since_last_marketplace_payment,
+      pgs.historical_median_payment_gap_days,
+
+      CASE
+        WHEN pgs.historical_median_payment_gap_days IS NULL
+          OR pgs.historical_median_payment_gap_days = 0
+          OR lp.last_marketplace_payment_date IS NULL
+        THEN NULL
+        ELSE ROUND(
+          SAFE_DIVIDE(
+            DATE_DIFF(CURRENT_DATE(), lp.last_marketplace_payment_date, DAY),
+            pgs.historical_median_payment_gap_days
+          ),
+          2
+        )
+      END AS marketplace_payment_gap_ratio
+
+    FROM latest_row l
+    LEFT JOIN trailing_medians tm
+      ON l.supplier_key = tm.supplier_key
+    LEFT JOIN negative_net_streak ns
+      ON l.supplier_key = ns.supplier_key
+    LEFT JOIN last_payment lp
+      ON l.supplier_key = lp.supplier_key
+    LEFT JOIN payment_gap_stats pgs
+      ON l.supplier_key = pgs.supplier_key
+
+    ORDER BY l.outstanding_bal DESC
     LIMIT 2000
   `;
 

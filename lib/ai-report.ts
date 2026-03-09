@@ -1,4 +1,5 @@
-// lib/ai-report.ts (v5: risk score 1-10 integer)
+// lib/ai-report.ts
+
 import { generateText } from "ai";
 import type { FlaggedSupplier } from "@/lib/risk-engine";
 
@@ -7,14 +8,22 @@ export type MetricEntry = {
   value: number | null;
   unit: string;
   explanation: string;
+  severity?: "NONE" | "LOW" | "MEDIUM" | "HIGH" | "CRITICAL";
+  score_contribution?: number;
 };
 
 export type SupplierRiskReport = {
   table_name: string;
   supplier_key: string;
   report_date: string;
+  headline: string;
   metrics: MetricEntry[];
-  overall_risk_score: number; // 1-10 integer, 1 = lowest risk
+  trigger_reasons: string[];
+  deep_interpretation: string[];
+  recommended_actions: string[];
+  engine_score_100: number;
+  engine_suggested_risk_score: number;
+  overall_risk_score: number; // final LLM score, 1-10
 };
 
 export type RiskReportOutput = {
@@ -44,68 +53,60 @@ export async function generateRiskReportJSON(
 ): Promise<RiskReportOutput> {
   const reportDate = new Date().toISOString().slice(0, 10);
 
-  const payload = flagged.map((s) => {
-    const receivable = safeNum(s.today_receivable);
-    const chargeback = safeNum(s.today_chargeback);
-    const computedNet = receivable - chargeback;
+  const payload = flagged.map((s) => ({
+    supplier_key: s.supplier_key,
+    supplier_name: s.supplier_name,
+    policy_version: s.policy_version,
 
-    return {
-      supplier_key: s.supplier_key,
-      supplier_name: s.supplier_name,
-      engine_risk_score: s.risk_score,
-      receivable,
-      chargeback,
-      computed_net_earning: computedNet,
-      available_balance: safeNum(s.today_available_balance),
-      outstanding_balance: safeNum(s.today_outstanding_bal),
-      receivable_wow_pct: s.receivable_change_pct ?? null,
-      liability_wow_pct: s.liability_change_pct ?? null,
-      prev_receivable: safeNum(s.prev_receivable ?? 0),
-      prev_liability: safeNum(s.prev_liability ?? 0),
-      today_liability: safeNum(s.today_liability),
-      flag_reasons: Array.isArray(s.flag_reasons) ? s.flag_reasons : [],
-    };
-  });
+    engine_score_100: safeNum(s.engine_score_100),
+    engine_suggested_risk_score: safeNum(s.engine_suggested_risk_score),
+
+    receivable: safeNum(s.today_receivable),
+    chargeback: safeNum(s.today_chargeback),
+    computed_net_earning: safeNum(s.today_net_earning),
+    available_balance: safeNum(s.today_available_balance),
+    outstanding_balance: safeNum(s.today_outstanding_bal),
+
+    receivable_wow_pct: s.receivable_change_pct ?? null,
+    liability_wow_pct: s.liability_change_pct ?? null,
+    marketplace_payment_change_pct: s.marketplace_payment_change_pct ?? null,
+    chargeback_ratio: s.chargeback_ratio ?? null,
+
+    due_from_supplier: safeNum(s.today_due_from_supplier ?? 0),
+    due_from_supplier_ratio: s.due_from_supplier_ratio ?? null,
+    due_from_supplier_turned_positive: !!s.due_from_supplier_turned_positive,
+
+    flag_reasons: Array.isArray(s.flag_reasons) ? s.flag_reasons : [],
+    metrics: Array.isArray(s.metrics) ? s.metrics : [],
+  }));
 
   const system = `
-You are a financial risk analyst at Payability (Amazon seller cash advance provider).
-You MUST output valid JSON and NOTHING else (no markdown, no backticks, no commentary).
+You are a senior financial risk analyst at Payability.
+You MUST output valid JSON and NOTHING else.
 
-For each supplier, output an object with:
-- "table_name": always "vm_transaction_summary"
-- "supplier_key": from input
-- "report_date": "${reportDate}"
-- "metrics": array of 6 metric objects, each with:
-  - "metric_id": one of RECEIVABLE_WOW_CHANGE, LIABILITY_WOW_CHANGE, CHARGEBACK_RATIO, NET_EARNING, AVAILABLE_BALANCE, OUTSTANDING_EXPOSURE
-  - "value": the numeric value
-  - "unit": appropriate unit (%, $, ratio)
-  - "explanation": 1-sentence explanation referencing actual numbers
-- "overall_risk_score": INTEGER from 1 to 10
-  - 1-2: Low risk - healthy financials, normal fluctuations
-  - 3-4: Moderate risk - some minor concerns, standard monitoring
-  - 5-6: Elevated risk - needs attention within a week
-  - 7-8: High risk - manual review required within 24-72h
-  - 9-10: Critical risk - immediate escalation/freeze recommended
+Your job:
+- Review each supplier's engine-generated risk signals and raw values.
+- Assign a FINAL overall_risk_score from 1 to 10, where 1 is lowest risk and 10 is highest risk.
+- Provide deep interpretation of why the supplier is risky or why the risk is manageable.
 
-Scoring guidance for overall_risk_score:
-- Start at 1 (healthy baseline)
-- Add +1-2 for each significant risk factor:
-  - Large WoW receivable swing (>50%): +1, (>200%): +2
-  - Large WoW liability increase (>50%): +1, (>200%): +2
-  - Chargeback ratio > 0.5: +1, > 0.9: +2
-  - Negative net earnings: +1, deeply negative (< -$50K): +2
-  - Negative available balance: +2
-  - Outstanding exposure > $500K with other flags: +1
-- Cap at 10
+Important scoring policy:
+- Start from engine_suggested_risk_score.
+- You may adjust by at most 2 points up or down.
+- Do NOT over-penalize pure growth in receivables if repayment quality remains healthy.
+- Put heavier emphasis on:
+  1) due_from_supplier becoming positive
+  2) negative available balance
+  3) negative net earning
+  4) high chargeback ratio
+  5) materially worsening liabilities
+  6) meaningful drop in marketplace payments when that data is available
+- If due_from_supplier turned positive OR available_balance is materially negative OR chargeback_ratio is extreme, the final score should usually be at least 7 unless there is strong offsetting evidence.
 
-Rules:
-- Include ALL 6 metric_ids for every supplier
-- overall_risk_score MUST be an integer 1-10
-- Do NOT invent data. Use only what is provided.
+Output JSON only.
 `.trim();
 
   const prompt = `
-Return JSON matching this schema:
+Return JSON matching this schema exactly:
 
 {
   "report_date": "${reportDate}",
@@ -122,25 +123,38 @@ Return JSON matching this schema:
       "table_name": "vm_transaction_summary",
       "supplier_key": string,
       "report_date": "${reportDate}",
+      "headline": string,
       "metrics": [
-        { "metric_id": "RECEIVABLE_WOW_CHANGE", "value": number|null, "unit": "%", "explanation": string },
-        { "metric_id": "LIABILITY_WOW_CHANGE", "value": number|null, "unit": "%", "explanation": string },
-        { "metric_id": "CHARGEBACK_RATIO", "value": number, "unit": "ratio", "explanation": string },
-        { "metric_id": "NET_EARNING", "value": number, "unit": "$", "explanation": string },
-        { "metric_id": "AVAILABLE_BALANCE", "value": number, "unit": "$", "explanation": string },
-        { "metric_id": "OUTSTANDING_EXPOSURE", "value": number, "unit": "$", "explanation": string }
+        {
+          "metric_id": string,
+          "value": number|null,
+          "unit": string,
+          "explanation": string,
+          "severity": "NONE" | "LOW" | "MEDIUM" | "HIGH" | "CRITICAL",
+          "score_contribution": number
+        }
       ],
-      "overall_risk_score": integer (1-10)
+      "trigger_reasons": string[],
+      "deep_interpretation": string[],
+      "recommended_actions": string[],
+      "engine_score_100": number,
+      "engine_suggested_risk_score": number,
+      "overall_risk_score": integer
     }
   ]
 }
 
-Constraints:
+Rules:
 - suppliers array length must equal ${payload.length}
-- overall_risk_score must be an INTEGER from 1 to 10. 1 = lowest risk. 10 = highest risk.
-- portfolio_summary counts based on overall_risk_score: critical = 8-10, high = 5-7, moderate = 1-4
+- overall_risk_score must be an INTEGER from 1 to 10
+- critical_count = number of suppliers with overall_risk_score 8-10
+- high_count = number of suppliers with overall_risk_score 5-7
+- moderate_count = number of suppliers with overall_risk_score 1-4
 - total_exposure = sum of all outstanding_balance values
-- CHARGEBACK_RATIO = chargeback / receivable (0-1+ scale)
+- Keep metrics aligned with input metrics; do not invent new numeric values
+- trigger_reasons should be concise and specific
+- deep_interpretation should be thoughtful and not just restate the numbers
+- recommended_actions should be practical for a risk operations team
 
 Input suppliers:
 ${JSON.stringify(payload)}
@@ -183,22 +197,37 @@ ${JSON.stringify(payload)}
       table_name: String(x?.table_name ?? "vm_transaction_summary"),
       supplier_key: String(x?.supplier_key ?? ""),
       report_date: String(x?.report_date ?? reportDate),
+      headline: String(x?.headline ?? ""),
       metrics: Array.isArray(x?.metrics)
         ? x.metrics.map((m: any) => ({
             metric_id: String(m?.metric_id ?? ""),
             value: m?.value === null ? null : safeNum(m?.value),
             unit: String(m?.unit ?? ""),
             explanation: String(m?.explanation ?? ""),
+            severity: String(m?.severity ?? "NONE") as MetricEntry["severity"],
+            score_contribution: safeNum(m?.score_contribution ?? 0),
           }))
         : [],
-      overall_risk_score: Math.max(1, Math.min(10, Math.round(safeNum(x?.overall_risk_score)))),
+      trigger_reasons: Array.isArray(x?.trigger_reasons)
+        ? x.trigger_reasons.map(String)
+        : [],
+      deep_interpretation: Array.isArray(x?.deep_interpretation)
+        ? x.deep_interpretation.map(String)
+        : [],
+      recommended_actions: Array.isArray(x?.recommended_actions)
+        ? x.recommended_actions.map(String)
+        : [],
+      engine_score_100: safeNum(x?.engine_score_100),
+      engine_suggested_risk_score: Math.max(
+        1,
+        Math.min(10, Math.round(safeNum(x?.engine_suggested_risk_score)))
+      ),
+      overall_risk_score: Math.max(
+        1,
+        Math.min(10, Math.round(safeNum(x?.overall_risk_score)))
+      ),
     })),
   };
 
   return report;
-}
-
-export async function generateRiskReport(flagged: FlaggedSupplier[]) {
-  const json = await generateRiskReportJSON(flagged);
-  return JSON.stringify(json, null, 2);
 }
