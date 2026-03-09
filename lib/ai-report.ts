@@ -1,42 +1,26 @@
-// lib/ai-report.ts
-
 import { generateText } from "ai";
 import type { FlaggedSupplier } from "@/lib/risk-engine";
 
-export type MetricEntry = {
+export type FinalMetricEntry = {
   metric_id: string;
   value: number | null;
   unit: string;
-  explanation: string;
-  severity?: "NONE" | "LOW" | "MEDIUM" | "HIGH" | "CRITICAL";
-  score_contribution?: number;
 };
 
-export type SupplierRiskReport = {
+export type FinalSupplierRiskReport = {
   table_name: string;
   supplier_key: string;
+  supplier_name: string;
   report_date: string;
-  headline: string;
-  metrics: MetricEntry[];
-  trigger_reasons: string[];
-  deep_interpretation: string[];
-  recommended_actions: string[];
-  engine_score_100: number;
-  engine_suggested_risk_score: number;
+  metrics: FinalMetricEntry[];
+  trigger_reason: string;
   overall_risk_score: number;
 };
 
 export type RiskReportOutput = {
   report_date: string;
   suppliers_reviewed: number;
-  portfolio_summary: {
-    critical_count: number;
-    high_count: number;
-    moderate_count: number;
-    total_exposure: number;
-    notes: string[];
-  };
-  suppliers: SupplierRiskReport[];
+  suppliers: FinalSupplierRiskReport[];
 };
 
 function safeNum(x: unknown): number {
@@ -48,6 +32,10 @@ function stripCodeFences(s: string) {
   return s.replace(/```json\s*/g, "").replace(/```\s*/g, "").trim();
 }
 
+function dedupeStrings(arr: string[]): string[] {
+  return [...new Set(arr.map((x) => x.trim()).filter(Boolean))];
+}
+
 export async function generateRiskReportJSON(
   flagged: FlaggedSupplier[]
 ): Promise<RiskReportOutput> {
@@ -56,52 +44,34 @@ export async function generateRiskReportJSON(
   const payload = flagged.map((s) => ({
     supplier_key: s.supplier_key,
     supplier_name: s.supplier_name,
-    policy_version: s.policy_version,
-
-    engine_score_100: safeNum(s.engine_score_100),
-    engine_suggested_risk_score: safeNum(s.engine_suggested_risk_score),
-
-    receivable: safeNum(s.today_receivable),
-    liability: safeNum(s.today_liability),
-    chargeback: safeNum(s.today_chargeback),
-    computed_net_earning: safeNum(s.today_net_earning),
-    available_balance: safeNum(s.today_available_balance),
-    outstanding_balance: safeNum(s.today_outstanding_bal),
-
-    due_from_supplier: safeNum(s.today_due_from_supplier ?? 0),
-    due_from_supplier_ratio: s.due_from_supplier_ratio ?? null,
-    due_from_supplier_turned_positive: !!s.due_from_supplier_turned_positive,
-
-    days_since_last_marketplace_payment:
-      s.days_since_last_marketplace_payment ?? null,
-
-    flag_reasons: Array.isArray(s.flag_reasons) ? s.flag_reasons : [],
-    metrics: Array.isArray(s.metrics) ? s.metrics : [],
+    overall_risk_score: safeNum(s.engine_suggested_risk_score),
+    trigger_reasons: Array.isArray(s.flag_reasons) ? s.flag_reasons : [],
+    metrics: Array.isArray(s.metrics)
+      ? s.metrics
+          .filter((m: any) => safeNum(m?.score_contribution) > 0)
+          .map((m: any) => ({
+            metric_id: String(m?.metric_id ?? ""),
+            value: m?.value === null ? null : safeNum(m?.value),
+            unit: String(m?.unit ?? ""),
+            explanation: String(m?.explanation ?? ""),
+            score_contribution: safeNum(m?.score_contribution ?? 0),
+          }))
+      : [],
   }));
 
   const system = `
 You are a senior financial risk analyst at Payability.
 You MUST output valid JSON and NOTHING else.
 
-Your job:
-- Review each supplier's engine-generated signals and raw values.
-- Assign a FINAL overall_risk_score from 1 to 10, where 1 is lowest risk and 10 is highest risk.
-- Provide deep interpretation of the real risk drivers.
-
-Important scoring policy:
-- Start from engine_suggested_risk_score.
-- You may adjust by at most 2 points up or down.
-- Place heaviest emphasis on:
-  1) due_from_supplier turning positive
-  2) materially negative available balance
-  3) sustained negative net earning
-  4) chargeback anomaly
-  5) payment delay beyond expected cadence
-  6) liability anomaly
-- Receivable anomaly alone should not drive the score too high unless there are repayment or balance-quality concerns.
-- Outstanding exposure is contextual and should affect prioritization, not the base risk score by itself.
-
-Output JSON only.
+For each supplier:
+- Keep only materially triggered metrics already provided in input.
+- Do not add metrics with score_contribution = 0.
+- Write one "trigger_reason" paragraph that combines:
+  1) the raw trigger reasons
+  2) the deeper business interpretation
+- Do not include recommendations.
+- overall_risk_score must be an integer from 1 to 10.
+- You may keep the same score as the input overall_risk_score, or adjust by at most 1 point if clearly justified by the trigger pattern.
 `.trim();
 
   const prompt = `
@@ -110,34 +80,20 @@ Return JSON matching this schema exactly:
 {
   "report_date": "${reportDate}",
   "suppliers_reviewed": ${payload.length},
-  "portfolio_summary": {
-    "critical_count": number,
-    "high_count": number,
-    "moderate_count": number,
-    "total_exposure": number,
-    "notes": string[]
-  },
   "suppliers": [
     {
       "table_name": "vm_transaction_summary",
       "supplier_key": string,
+      "supplier_name": string,
       "report_date": "${reportDate}",
-      "headline": string,
       "metrics": [
         {
           "metric_id": string,
           "value": number|null,
-          "unit": string,
-          "explanation": string,
-          "severity": "NONE" | "LOW" | "MEDIUM" | "HIGH" | "CRITICAL",
-          "score_contribution": number
+          "unit": string
         }
       ],
-      "trigger_reasons": string[],
-      "deep_interpretation": string[],
-      "recommended_actions": string[],
-      "engine_score_100": number,
-      "engine_suggested_risk_score": number,
+      "trigger_reason": string,
       "overall_risk_score": integer
     }
   ]
@@ -145,14 +101,15 @@ Return JSON matching this schema exactly:
 
 Rules:
 - suppliers array length must equal ${payload.length}
-- overall_risk_score must be an INTEGER from 1 to 10
-- critical_count = number of suppliers with overall_risk_score 8-10
-- high_count = number of suppliers with overall_risk_score 5-7
-- moderate_count = number of suppliers with overall_risk_score 1-4
-- total_exposure = sum of all outstanding_balance values
-- Keep metrics aligned with input metrics; do not invent new numeric values
-- trigger_reasons should be concise and specific
-- deep_interpretation should explain the business meaning of the signals, not just restate numbers
+- metrics must only include metrics from input where score_contribution > 0
+- each metric object must contain ONLY:
+  - metric_id
+  - value
+  - unit
+- trigger_reason should merge trigger reasons with deeper interpretation into one concise paragraph
+- do not include recommendation actions
+- do not include engine_score_100
+- do not include engine_suggested_risk_score
 
 Input suppliers:
 ${JSON.stringify(payload)}
@@ -173,8 +130,11 @@ ${JSON.stringify(payload)}
   } catch {
     const start = raw.indexOf("{");
     const end = raw.lastIndexOf("}");
-    if (start >= 0 && end > start) parsed = JSON.parse(raw.slice(start, end + 1));
-    else throw new Error("AI report is not valid JSON.");
+    if (start >= 0 && end > start) {
+      parsed = JSON.parse(raw.slice(start, end + 1));
+    } else {
+      throw new Error("AI report is not valid JSON.");
+    }
   }
 
   const suppliers = Array.isArray(parsed?.suppliers) ? parsed.suppliers : [];
@@ -182,49 +142,44 @@ ${JSON.stringify(payload)}
   const report: RiskReportOutput = {
     report_date: String(parsed?.report_date ?? reportDate),
     suppliers_reviewed: safeNum(parsed?.suppliers_reviewed ?? payload.length),
-    portfolio_summary: {
-      critical_count: safeNum(parsed?.portfolio_summary?.critical_count),
-      high_count: safeNum(parsed?.portfolio_summary?.high_count),
-      moderate_count: safeNum(parsed?.portfolio_summary?.moderate_count),
-      total_exposure: safeNum(parsed?.portfolio_summary?.total_exposure),
-      notes: Array.isArray(parsed?.portfolio_summary?.notes)
-        ? parsed.portfolio_summary.notes.map(String)
-        : [],
-    },
-    suppliers: suppliers.map((x: any) => ({
-      table_name: String(x?.table_name ?? "vm_transaction_summary"),
-      supplier_key: String(x?.supplier_key ?? ""),
-      report_date: String(x?.report_date ?? reportDate),
-      headline: String(x?.headline ?? ""),
-      metrics: Array.isArray(x?.metrics)
+    suppliers: suppliers.map((x: any, idx: number) => {
+      const inputSupplier = payload[idx];
+
+      const metrics = Array.isArray(x?.metrics)
         ? x.metrics.map((m: any) => ({
             metric_id: String(m?.metric_id ?? ""),
             value: m?.value === null ? null : safeNum(m?.value),
             unit: String(m?.unit ?? ""),
-            explanation: String(m?.explanation ?? ""),
-            severity: String(m?.severity ?? "NONE") as MetricEntry["severity"],
-            score_contribution: safeNum(m?.score_contribution ?? 0),
           }))
-        : [],
-      trigger_reasons: Array.isArray(x?.trigger_reasons)
-        ? x.trigger_reasons.map(String)
-        : [],
-      deep_interpretation: Array.isArray(x?.deep_interpretation)
-        ? x.deep_interpretation.map(String)
-        : [],
-      recommended_actions: Array.isArray(x?.recommended_actions)
-        ? x.recommended_actions.map(String)
-        : [],
-      engine_score_100: safeNum(x?.engine_score_100),
-      engine_suggested_risk_score: Math.max(
-        1,
-        Math.min(10, Math.round(safeNum(x?.engine_suggested_risk_score)))
-      ),
-      overall_risk_score: Math.max(
-        1,
-        Math.min(10, Math.round(safeNum(x?.overall_risk_score)))
-      ),
-    })),
+        : [];
+
+      const filteredMetrics = metrics.filter((m) =>
+        inputSupplier?.metrics?.some((im: any) => im.metric_id === m.metric_id)
+      );
+
+      const fallbackTriggerReason = dedupeStrings([
+        ...(inputSupplier?.trigger_reasons ?? []),
+        `This supplier shows risk signals requiring review based on the triggered metrics above.`,
+      ]).join(" ");
+
+      return {
+        table_name: "vm_transaction_summary",
+        supplier_key: String(x?.supplier_key ?? inputSupplier?.supplier_key ?? ""),
+        supplier_name: String(x?.supplier_name ?? inputSupplier?.supplier_name ?? ""),
+        report_date: String(x?.report_date ?? reportDate),
+        metrics: filteredMetrics,
+        trigger_reason: String(x?.trigger_reason ?? fallbackTriggerReason),
+        overall_risk_score: Math.max(
+          1,
+          Math.min(
+            10,
+            Math.round(
+              safeNum(x?.overall_risk_score ?? inputSupplier?.overall_risk_score ?? 5)
+            )
+          )
+        ),
+      };
+    }),
   };
 
   return report;
