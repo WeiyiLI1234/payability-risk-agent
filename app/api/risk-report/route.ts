@@ -43,7 +43,7 @@ export async function GET() {
       ms: Date.now() - start,
     });
 
-    const topFlagged = result.flagged.slice(0, 20);
+    const topFlagged = result.flagged;
 
     const aiReportJson = await generateRiskReportJSON(topFlagged);
 
