@@ -6,6 +6,7 @@ import { NextResponse } from "next/server";
 import { getChangedSupplierKeys, getSupplierRiskInputData } from "@/lib/bigquery";
 import { flagSuppliers } from "@/lib/risk-engine";
 import type { DailyChangeRow, FlaggedSupplier } from "@/lib/risk-engine";
+import { supabaseAdmin } from "@/lib/supabase-admin";
 
 function buildSimpleFlaggedOutput(flagged: FlaggedSupplier[], reportDate: string) {
   return {
@@ -69,7 +70,41 @@ export async function GET() {
 
     const simpleOutput = buildSimpleFlaggedOutput(result.flagged, reportDate);
 
+    // ── 存 Supabase ──────────────────────────────────────────
+    const sb = supabaseAdmin();
+
+    const { data: inserted, error: dbError } = await sb
+      .from("agent_runs")
+      .insert({
+        report_date: reportDate,
+        total_suppliers: result.total,
+        flagged_count: result.flagged.length,
+        ai_report: JSON.stringify(simpleOutput),
+        debug: {
+          duration_ms: Date.now() - start,
+          flagged_keys: result.flagged.map((s) => s.supplier_key),
+          score_distribution: {
+            critical: result.flagged.filter((s) => s.engine_suggested_risk_score >= 8).length,
+            high: result.flagged.filter(
+              (s) =>
+                s.engine_suggested_risk_score >= 5 && s.engine_suggested_risk_score <= 7
+            ).length,
+            moderate: result.flagged.filter((s) => s.engine_suggested_risk_score <= 4).length,
+          },
+        },
+      })
+      .select("id, created_at")
+      .single();
+
+    if (dbError) {
+      console.error("[risk-report] Supabase insert failed", dbError);
+    } else {
+      console.log("[risk-report] Saved to Supabase, run id:", inserted?.id);
+    }
+
+    // ── 返回结果 ──────────────────────────────────────────────
     return NextResponse.json({
+      run_id: inserted?.id ?? null,
       scanned_supplier_count: result.total,
       flagged_supplier_count: result.flagged.length,
       returned_supplier_count: simpleOutput.suppliers.length,
