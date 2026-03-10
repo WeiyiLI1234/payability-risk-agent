@@ -1,57 +1,25 @@
-// app/api/risk-report/route.ts
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 import { NextResponse } from "next/server";
-import { getChangedSupplierKeys, getSupplierRiskInputData } from "@/lib/bigquery";
+import { getDailyChangeData } from "@/lib/bigquery";
 import { flagSuppliers } from "@/lib/risk-engine";
-import type { DailyChangeRow, FlaggedSupplier } from "@/lib/risk-engine";
+import { generateRiskReportJSON } from "@/lib/ai-report";
 import { supabaseAdmin } from "@/lib/supabase-admin";
-
-function buildSimpleFlaggedOutput(flagged: FlaggedSupplier[], reportDate: string) {
-  return {
-    report_date: reportDate,
-    suppliers_reviewed: flagged.length,
-    suppliers: flagged.map((s) => ({
-      table_name: "vm_transaction_summary",
-      supplier_key: s.supplier_key,
-      supplier_name: s.supplier_name,
-      report_date: reportDate,
-      metrics: Array.isArray(s.metrics)
-        ? s.metrics
-            .filter((m) => Number(m?.score_contribution ?? 0) > 0)
-            .map((m) => ({
-              metric_id: m.metric_id,
-              value: m.value,
-              unit: m.unit,
-            }))
-        : [],
-      trigger_reason: Array.isArray(s.flag_reasons) ? s.flag_reasons.join(" ") : "",
-      overall_risk_score: s.engine_suggested_risk_score,
-    })),
-  };
-}
+import type { DailyChangeRow, FlaggedSupplier } from "@/lib/risk-engine";
 
 export async function GET() {
   const start = Date.now();
-  const reportDateIso = new Date().toISOString();
-  const reportDate = reportDateIso.slice(0, 10);
+  const reportDate = new Date().toISOString();
 
   try {
-    console.log("[risk-report] START", reportDateIso);
+    console.log("[risk-report] START", reportDate);
 
-    const changedSupplierKeys = await getChangedSupplierKeys(2);
+    const sb = supabaseAdmin();
 
-    console.log("[risk-report] changed suppliers", {
-      count: changedSupplierKeys.length,
-      ms: Date.now() - start,
-    });
-
-    const rowsRaw = await getSupplierRiskInputData({
-      supplierKeys: changedSupplierKeys,
-      limit: 2000,
-    });
-
+    // 1) Query BigQuery
+    console.log("[risk-report] Querying BigQuery...");
+    const rowsRaw = await getDailyChangeData();
     const rows = (Array.isArray(rowsRaw) ? rowsRaw : []) as DailyChangeRow[];
 
     console.log("[risk-report] BigQuery done", {
@@ -59,65 +27,118 @@ export async function GET() {
       ms: Date.now() - start,
     });
 
+    // 2) Run risk engine
+    console.log("[risk-report] Running risk engine...");
     const result = flagSuppliers(rows);
 
     console.log("[risk-report] Risk engine done", {
       total: result.total,
       flagged: result.flagged.length,
-      unflagged: result.unflagged.length,
       ms: Date.now() - start,
     });
 
-    const simpleOutput = buildSimpleFlaggedOutput(result.flagged, reportDate);
+    // 3) Generate AI report
+    console.log("[risk-report] Generating AI report...");
+    const topFlagged: FlaggedSupplier[] = result.flagged.slice(0, 20);
+    const report = await generateRiskReportJSON(topFlagged);
 
-    // ── 存 Supabase ──────────────────────────────────────────
-    const sb = supabaseAdmin();
+    console.log("[risk-report] AI done", {
+      ms: Date.now() - start,
+    });
 
-    const { data: inserted, error: dbError } = await sb
+    // 4) Save to Supabase: agent_runs
+    console.log("[risk-report] Writing agent_runs...");
+    const { data: run, error: runErr } = await sb
       .from("agent_runs")
       .insert({
         report_date: reportDate,
         total_suppliers: result.total,
         flagged_count: result.flagged.length,
-        ai_report: JSON.stringify(simpleOutput),
+        ai_report: typeof report === "string" ? report : JSON.stringify(report),
         debug: {
-          duration_ms: Date.now() - start,
-          flagged_keys: result.flagged.map((s) => s.supplier_key),
-          score_distribution: {
-            critical: result.flagged.filter((s) => s.engine_suggested_risk_score >= 8).length,
-            high: result.flagged.filter(
-              (s) =>
-                s.engine_suggested_risk_score >= 5 && s.engine_suggested_risk_score <= 7
-            ).length,
-            moderate: result.flagged.filter((s) => s.engine_suggested_risk_score <= 4).length,
-          },
+          source: "manual-risk-report",
+          rows_length: rows.length,
+          execution_time_ms: Date.now() - start,
         },
       })
-      .select("id, created_at")
+      .select("id")
       .single();
 
-    if (dbError) {
-      console.error("[risk-report] Supabase insert failed", dbError);
-    } else {
-      console.log("[risk-report] Saved to Supabase, run id:", inserted?.id);
+    if (runErr) {
+      console.error("[risk-report] agent_runs insert error", runErr);
+      throw new Error(`Supabase insert agent_runs failed: ${runErr.message}`);
     }
 
-    // ── 返回结果 ──────────────────────────────────────────────
-    return NextResponse.json({
-      run_id: inserted?.id ?? null,
-      scanned_supplier_count: result.total,
-      flagged_supplier_count: result.flagged.length,
-      returned_supplier_count: simpleOutput.suppliers.length,
-      ...simpleOutput,
+    if (!run?.id) {
+      throw new Error("Supabase insert agent_runs failed: missing run id");
+    }
+
+    // 5) Save flagged suppliers
+    let savedFlagged = 0;
+
+    if (topFlagged.length > 0) {
+      console.log("[risk-report] Writing agent_flagged_suppliers...");
+
+      const detailRows = topFlagged.map((s) => ({
+        run_id: run.id,
+        supplier_key: s.supplier_key,
+        supplier_name: s.supplier_name,
+        metrics: s,
+        reasons: s.flag_reasons ?? [],
+      }));
+
+      const { error: detailErr } = await sb
+        .from("agent_flagged_suppliers")
+        .insert(detailRows);
+
+      if (detailErr) {
+        console.error("[risk-report] flagged details insert error", detailErr);
+        throw new Error(
+          `Supabase insert agent_flagged_suppliers failed: ${detailErr.message}`
+        );
+      }
+
+      savedFlagged = detailRows.length;
+    }
+
+    console.log("[risk-report] DONE", {
+      run_id: run.id,
+      total: result.total,
+      flagged: result.flagged.length,
+      saved_flagged: savedFlagged,
+      ms: Date.now() - start,
     });
-  } catch (error: any) {
+
+    return NextResponse.json({
+      success: true,
+      run_id: run.id,
+      report_date: reportDate,
+
+      debug: {
+        rows_length: rows.length,
+        sample_rows: rows.slice(0, 3),
+        execution_time_ms: Date.now() - start,
+      },
+
+      summary: {
+        total_suppliers: result.total,
+        flagged_count: result.flagged.length,
+        unflagged_count: result.unflagged,
+        saved_to_db: true,
+        saved_flagged: savedFlagged,
+      },
+
+      ai_report: report,
+      flagged_details: result.flagged.slice(0, 10),
+    });
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
     console.error("[risk-report] ERROR", error);
 
     return NextResponse.json(
       {
         success: false,
-        error: error?.message ?? String(error),
-        report_date: reportDateIso,
+        error: message,
       },
       { status: 500 }
     );
