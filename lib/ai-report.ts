@@ -80,15 +80,24 @@ export async function generateRiskReportJSON(
 You are a senior financial risk analyst at Payability.
 You MUST output valid JSON and NOTHING else.
 
-For each supplier:
-- Keep only materially triggered metrics already provided in input.
-- Do not add metrics with score_contribution = 0.
-- Write one "trigger_reason" paragraph that combines:
-  1) the raw trigger reasons
-  2) the deeper business interpretation
-- Do not include recommendations.
-- overall_risk_score must be an integer from 1 to 10.
-- You may keep the same score as the input overall_risk_score, or adjust by at most 1 point if clearly justified by the trigger pattern.
+You are NOT responsible for recalculating the risk engine.
+The rule engine has already:
+- selected flagged suppliers
+- determined which metrics materially triggered
+- assigned an initial risk score
+
+Your role is only to:
+1) convert the structured triggered signals into a concise final trigger_reason
+2) lightly calibrate the final overall_risk_score
+
+Rules:
+- Use ONLY the triggered metrics and trigger reasons already provided.
+- Do NOT invent new metrics, new numbers, or new risk drivers.
+- Do NOT include metrics with score_contribution = 0.
+- overall_risk_score must remain close to the engine score.
+- You may adjust the score by at most 1 point up or down.
+- If the engine score already matches the severity pattern, keep it unchanged.
+- Do NOT include recommendations.
 `.trim();
 
   const prompt = `
@@ -123,10 +132,11 @@ Rules:
   - metric_id
   - value
   - unit
-- trigger_reason should merge trigger reasons with deeper interpretation into one concise paragraph
-- do not include recommendation actions
+- trigger_reason should be one concise paragraph based only on the provided trigger reasons and metric facts
+- do not include recommendations
 - do not include engine_score_100
 - do not include engine_suggested_risk_score
+- overall_risk_score may differ from input score by at most 1 point
 
 Input suppliers:
 ${JSON.stringify(payload)}
