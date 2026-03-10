@@ -67,10 +67,14 @@ export async function GET() {
       ms: Date.now() - start,
     });
 
-    // 直接返回所有 flagged suppliers 的简化结果，不走 LLM
     const simpleOutput = buildSimpleFlaggedOutput(result.flagged, reportDate);
 
-    return NextResponse.json(simpleOutput);
+    return NextResponse.json({
+      scanned_supplier_count: result.total,
+      flagged_supplier_count: result.flagged.length,
+      returned_supplier_count: simpleOutput.suppliers.length,
+      ...simpleOutput,
+    });
   } catch (error: any) {
     console.error("[risk-report] ERROR", error);
 
