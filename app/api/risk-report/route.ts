@@ -49,6 +49,21 @@ export async function GET() {
       ms: Date.now() - start,
     });
 
+    // ── Early exit: no changed suppliers, skip BigQuery + engine ─────────────
+    if (changedSupplierKeys.length === 0) {
+      console.log("[risk-report] No changed suppliers in the last 2 days, exiting early.");
+      return NextResponse.json({
+        run_id: null,
+        scanned_supplier_count: 0,
+        flagged_supplier_count: 0,
+        supplier_rows_inserted: 0,
+        returned_supplier_count: 0,
+        report_date: reportDate,
+        suppliers_reviewed: 0,
+        suppliers: [],
+      });
+    }
+
     const rowsRaw = await getSupplierRiskInputData({
       supplierKeys: changedSupplierKeys,
       limit: 2000,
