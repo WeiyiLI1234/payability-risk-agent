@@ -1,25 +1,59 @@
+// app/api/risk-report/route.ts
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 import { NextResponse } from "next/server";
-import { getDailyChangeData } from "@/lib/bigquery";
+import { getChangedSupplierKeys, getSupplierRiskInputData } from "@/lib/bigquery";
 import { flagSuppliers } from "@/lib/risk-engine";
-import { generateRiskReportJSON } from "@/lib/ai-report";
-import { supabaseAdmin } from "@/lib/supabase-admin";
 import type { DailyChangeRow, FlaggedSupplier } from "@/lib/risk-engine";
+import { supabaseAdmin } from "@/lib/supabase-admin";
+import { RISK_THRESHOLDS } from "@/lib/risk-policy";
+
+function buildSimpleFlaggedOutput(flagged: FlaggedSupplier[], reportDate: string) {
+  return {
+    report_date: reportDate,
+    suppliers_reviewed: flagged.length,
+    suppliers: flagged.map((s) => ({
+      table_name: "vm_transaction_summary",
+      supplier_key: s.supplier_key,
+      supplier_name: s.supplier_name,
+      report_date: reportDate,
+      metrics: Array.isArray(s.metrics)
+        ? s.metrics
+            .filter((m) => Number(m?.score_contribution ?? 0) > 0)
+            .map((m) => ({
+              metric_id: m.metric_id,
+              value: m.value,
+              unit: m.unit,
+            }))
+        : [],
+      trigger_reason: Array.isArray(s.flag_reasons) ? s.flag_reasons.join(" ") : "",
+      overall_risk_score: s.engine_suggested_risk_score,
+    })),
+  };
+}
 
 export async function GET() {
   const start = Date.now();
-  const reportDate = new Date().toISOString();
+  const reportDateIso = new Date().toISOString();
+  const reportDate = reportDateIso.slice(0, 10);
 
   try {
-    console.log("[risk-report] START", reportDate);
+    console.log("[risk-report] START", reportDateIso);
 
-    const sb = supabaseAdmin();
+    // ── Step 1: Fetch from BigQuery ───────────────────────────────────────────
+    const changedSupplierKeys = await getChangedSupplierKeys(2);
 
-    // 1) Query BigQuery
-    console.log("[risk-report] Querying BigQuery...");
-    const rowsRaw = await getDailyChangeData();
+    console.log("[risk-report] changed suppliers", {
+      count: changedSupplierKeys.length,
+      ms: Date.now() - start,
+    });
+
+    const rowsRaw = await getSupplierRiskInputData({
+      supplierKeys: changedSupplierKeys,
+      limit: 2000,
+    });
+
     const rows = (Array.isArray(rowsRaw) ? rowsRaw : []) as DailyChangeRow[];
 
     console.log("[risk-report] BigQuery done", {
@@ -27,118 +61,123 @@ export async function GET() {
       ms: Date.now() - start,
     });
 
-    // 2) Run risk engine
-    console.log("[risk-report] Running risk engine...");
+    // ── Step 2: Run risk engine ───────────────────────────────────────────────
     const result = flagSuppliers(rows);
 
     console.log("[risk-report] Risk engine done", {
       total: result.total,
       flagged: result.flagged.length,
+      unflagged: result.unflagged.length,
       ms: Date.now() - start,
     });
 
-    // 3) Generate AI report
-    console.log("[risk-report] Generating AI report...");
-    const topFlagged: FlaggedSupplier[] = result.flagged.slice(0, 20);
-    const report = await generateRiskReportJSON(topFlagged);
+    // Scheme B safety net: only keep suppliers with risk_score >= minFlaggedRiskScore
+    const highRiskFlagged = result.flagged.filter(
+      (s) => s.engine_suggested_risk_score >= RISK_THRESHOLDS.minFlaggedRiskScore
+    );
 
-    console.log("[risk-report] AI done", {
-      ms: Date.now() - start,
-    });
+    const simpleOutput = buildSimpleFlaggedOutput(highRiskFlagged, reportDate);
 
-    // 4) Save to Supabase: agent_runs
-    console.log("[risk-report] Writing agent_runs...");
-    const { data: run, error: runErr } = await sb
+    console.log("[risk-report] simpleOutput size (bytes)", JSON.stringify(simpleOutput).length);
+
+    // ── Step 3: Insert summary row into agent_runs ────────────────────────────
+    const sb = supabaseAdmin();
+    console.log("[risk-report] Supabase client initialized");
+
+    const { data: runRow, error: runError } = await sb
       .from("agent_runs")
       .insert({
         report_date: reportDate,
         total_suppliers: result.total,
-        flagged_count: result.flagged.length,
-        ai_report: typeof report === "string" ? report : JSON.stringify(report),
+        flagged_count: highRiskFlagged.length,
+        ai_report: JSON.stringify({
+          report_date: simpleOutput.report_date,
+          suppliers_reviewed: simpleOutput.suppliers_reviewed,
+          suppliers: simpleOutput.suppliers.map((s) => ({
+            supplier_key: s.supplier_key,
+            supplier_name: s.supplier_name,
+            overall_risk_score: s.overall_risk_score,
+            trigger_reason: s.trigger_reason,
+          })),
+        }),
         debug: {
-          source: "manual-risk-report",
-          rows_length: rows.length,
-          execution_time_ms: Date.now() - start,
+          duration_ms: Date.now() - start,
+          policy_version: result.flagged[0]?.policy_version ?? null,
+          flagged_keys: highRiskFlagged.map((s) => s.supplier_key),
+          score_distribution: {
+            critical: highRiskFlagged.filter((s) => s.engine_suggested_risk_score >= 8).length,
+            high: highRiskFlagged.filter(
+              (s) =>
+                s.engine_suggested_risk_score >= 5 && s.engine_suggested_risk_score <= 7
+            ).length,
+          },
         },
       })
-      .select("id")
+      .select("id, created_at")
       .single();
 
-    if (runErr) {
-      console.error("[risk-report] agent_runs insert error", runErr);
-      throw new Error(`Supabase insert agent_runs failed: ${runErr.message}`);
+    if (runError) {
+      console.error("[risk-report] agent_runs insert failed", runError);
+    } else {
+      console.log("[risk-report] agent_runs row saved, run_id:", runRow?.id);
     }
 
-    if (!run?.id) {
-      throw new Error("Supabase insert agent_runs failed: missing run id");
-    }
+    // ── Step 4: Insert one row per flagged supplier into agent_flagged_suppliers
+    // Only runs if we successfully got a run_id and have flagged suppliers.
+    let supplierRowsInserted = 0;
 
-    // 5) Save flagged suppliers
-    let savedFlagged = 0;
-
-    if (topFlagged.length > 0) {
-      console.log("[risk-report] Writing agent_flagged_suppliers...");
-
-      const detailRows = topFlagged.map((s) => ({
-        run_id: run.id,
+    if (runRow?.id && highRiskFlagged.length > 0) {
+      const supplierRows = highRiskFlagged.map((s) => ({
+        run_id: runRow.id,
         supplier_key: s.supplier_key,
         supplier_name: s.supplier_name,
-        metrics: s,
-        reasons: s.flag_reasons ?? [],
+        // metrics: triggered metrics only, with full context for analyst review
+        metrics: Array.isArray(s.metrics)
+          ? s.metrics
+              .filter((m) => Number(m?.score_contribution ?? 0) > 0)
+              .map((m) => ({
+                metric_id: m.metric_id,
+                value: m.value,
+                unit: m.unit,
+                severity: m.severity,
+                score_contribution: m.score_contribution,
+                explanation: m.explanation,
+              }))
+          : [],
+        // reasons: raw array of flag reason strings
+        reasons: Array.isArray(s.flag_reasons) ? s.flag_reasons : [],
+        overall_risk_score: s.engine_suggested_risk_score,
       }));
 
-      const { error: detailErr } = await sb
+      const { error: suppliersError, count } = await sb
         .from("agent_flagged_suppliers")
-        .insert(detailRows);
+        .insert(supplierRows, { count: "exact" });
 
-      if (detailErr) {
-        console.error("[risk-report] flagged details insert error", detailErr);
-        throw new Error(
-          `Supabase insert agent_flagged_suppliers failed: ${detailErr.message}`
-        );
+      if (suppliersError) {
+        console.error("[risk-report] agent_flagged_suppliers insert failed", suppliersError);
+      } else {
+        supplierRowsInserted = count ?? supplierRows.length;
+        console.log("[risk-report] agent_flagged_suppliers rows inserted:", supplierRowsInserted);
       }
-
-      savedFlagged = detailRows.length;
     }
 
-    console.log("[risk-report] DONE", {
-      run_id: run.id,
-      total: result.total,
-      flagged: result.flagged.length,
-      saved_flagged: savedFlagged,
-      ms: Date.now() - start,
-    });
-
+    // ── Step 5: Return result ─────────────────────────────────────────────────
     return NextResponse.json({
-      success: true,
-      run_id: run.id,
-      report_date: reportDate,
-
-      debug: {
-        rows_length: rows.length,
-        sample_rows: rows.slice(0, 3),
-        execution_time_ms: Date.now() - start,
-      },
-
-      summary: {
-        total_suppliers: result.total,
-        flagged_count: result.flagged.length,
-        unflagged_count: result.unflagged,
-        saved_to_db: true,
-        saved_flagged: savedFlagged,
-      },
-
-      ai_report: report,
-      flagged_details: result.flagged.slice(0, 10),
+      run_id: runRow?.id ?? null,
+      scanned_supplier_count: result.total,
+      flagged_supplier_count: highRiskFlagged.length,
+      supplier_rows_inserted: supplierRowsInserted,
+      returned_supplier_count: simpleOutput.suppliers.length,
+      ...simpleOutput,
     });
-  } catch (error: unknown) {
-    const message = error instanceof Error ? error.message : String(error);
+  } catch (error: any) {
     console.error("[risk-report] ERROR", error);
 
     return NextResponse.json(
       {
         success: false,
-        error: message,
+        error: error?.message ?? String(error),
+        report_date: reportDateIso,
       },
       { status: 500 }
     );
