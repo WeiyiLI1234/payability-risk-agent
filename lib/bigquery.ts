@@ -55,25 +55,35 @@ export async function getSupplierRiskInputData(
       FROM UNNEST(@supplier_keys) AS supplier_key
     ),
 
+    -- Only include suppliers that are currently Active in v_supplier_summary.
+    -- Suspended and Pending suppliers are excluded entirely from the risk engine.
+    active_suppliers AS (
+      SELECT supplier_key
+      FROM \`bigqueryexport-183608.PayabilitySheets.v_supplier_summary\`
+      WHERE payability_status = 'Active'
+    ),
+
     base AS (
       SELECT
-        supplier_key,
-        supplier_name,
-        xact_post_date,
+        t.supplier_key,
+        t.supplier_name,
+        t.xact_post_date,
 
-        IFNULL(receivable, 0) AS receivable,
-        IFNULL(potential_liability, 0) AS liability,
-        IFNULL(net_earning, 0) AS net_earning,
-        IFNULL(chargeback, 0) AS chargeback,
-        IFNULL(available_balance, 0) AS available_balance,
-        IFNULL(outstanding_bal, 0) AS outstanding_bal,
-        IFNULL(marketplace_payment, 0) AS marketplace_payment,
-        IFNULL(due_from_supplier, 0) AS due_from_supplier
-      FROM \`bigqueryexport-183608.PayabilitySheets.vm_transaction_summary\`
-      WHERE xact_post_date <= CURRENT_DATE()
+        IFNULL(t.receivable, 0) AS receivable,
+        IFNULL(t.potential_liability, 0) AS liability,
+        IFNULL(t.net_earning, 0) AS net_earning,
+        IFNULL(t.chargeback, 0) AS chargeback,
+        IFNULL(t.available_balance, 0) AS available_balance,
+        IFNULL(t.outstanding_bal, 0) AS outstanding_bal,
+        IFNULL(t.marketplace_payment, 0) AS marketplace_payment,
+        IFNULL(t.due_from_supplier, 0) AS due_from_supplier
+      FROM \`bigqueryexport-183608.PayabilitySheets.vm_transaction_summary\` t
+      INNER JOIN active_suppliers a
+        ON t.supplier_key = a.supplier_key
+      WHERE t.xact_post_date <= CURRENT_DATE()
         AND (
           @use_supplier_filter = FALSE
-          OR supplier_key IN (SELECT supplier_key FROM target_suppliers)
+          OR t.supplier_key IN (SELECT supplier_key FROM target_suppliers)
         )
     ),
 
@@ -111,6 +121,7 @@ export async function getSupplierRiskInputData(
       SELECT *
       FROM supplier_history
       WHERE rn_desc = 1
+        AND liability >= 1000  -- skip suppliers with today_liability < $1,000
     ),
 
     trailing_6 AS (
