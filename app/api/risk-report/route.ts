@@ -1,9 +1,8 @@
-// app/api/risk-report/route.ts
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 import { NextResponse } from "next/server";
-import { getChangedSupplierKeys, getSupplierRiskInputData } from "@/lib/bigquery";
+import { getSupplierRiskInputData } from "@/lib/bigquery";
 import { flagSuppliers } from "@/lib/risk-engine";
 import type { DailyChangeRow, FlaggedSupplier } from "@/lib/risk-engine";
 import { supabaseAdmin } from "@/lib/supabase-admin";
@@ -41,17 +40,22 @@ export async function GET() {
   try {
     console.log("[risk-report] START", reportDateIso);
 
-    // ── Step 1: Fetch from BigQuery ───────────────────────────────────────────
-    const changedSupplierKeys = await getChangedSupplierKeys(2);
+    // ── Step 1: Fetch all active suppliers from BigQuery ─────────────────────
+    // No incremental "changed supplier" pre-filter anymore.
+    const rowsRaw = await getSupplierRiskInputData({
+      limit: 5000,
+    });
 
-    console.log("[risk-report] changed suppliers", {
-      count: changedSupplierKeys.length,
+    const rows = (Array.isArray(rowsRaw) ? rowsRaw : []) as DailyChangeRow[];
+
+    console.log("[risk-report] BigQuery done", {
+      rows_length: rows.length,
       ms: Date.now() - start,
     });
 
-    // ── Early exit: no changed suppliers, skip BigQuery + engine ─────────────
-    if (changedSupplierKeys.length === 0) {
-      console.log("[risk-report] No changed suppliers in the last 2 days, exiting early.");
+    // Optional early exit only if BigQuery truly returned nothing
+    if (rows.length === 0) {
+      console.log("[risk-report] No active supplier rows returned, exiting early.");
       return NextResponse.json({
         run_id: null,
         scanned_supplier_count: 0,
@@ -64,18 +68,6 @@ export async function GET() {
       });
     }
 
-    const rowsRaw = await getSupplierRiskInputData({
-      supplierKeys: changedSupplierKeys,
-      limit: 2000,
-    });
-
-    const rows = (Array.isArray(rowsRaw) ? rowsRaw : []) as DailyChangeRow[];
-
-    console.log("[risk-report] BigQuery done", {
-      rows_length: rows.length,
-      ms: Date.now() - start,
-    });
-
     // ── Step 2: Run risk engine ───────────────────────────────────────────────
     const result = flagSuppliers(rows);
 
@@ -86,7 +78,7 @@ export async function GET() {
       ms: Date.now() - start,
     });
 
-    // Scheme B safety net: only keep suppliers with risk_score >= minFlaggedRiskScore
+    // Scheme B safety net: keep suppliers with risk_score >= minFlaggedRiskScore
     const highRiskFlagged = result.flagged.filter(
       (s) => s.engine_suggested_risk_score >= RISK_THRESHOLDS.minFlaggedRiskScore
     );
@@ -117,13 +109,21 @@ export async function GET() {
         }),
         debug: {
           duration_ms: Date.now() - start,
-          policy_version: result.flagged[0]?.policy_version ?? null,
+          policy_version:
+            highRiskFlagged[0]?.policy_version ??
+            result.flagged[0]?.policy_version ??
+            result.unflagged[0]?.policy_version ??
+            null,
           flagged_keys: highRiskFlagged.map((s) => s.supplier_key),
           score_distribution: {
             critical: highRiskFlagged.filter((s) => s.engine_suggested_risk_score >= 8).length,
             high: highRiskFlagged.filter(
               (s) =>
                 s.engine_suggested_risk_score >= 5 && s.engine_suggested_risk_score <= 7
+            ).length,
+            monitor: highRiskFlagged.filter(
+              (s) =>
+                s.engine_suggested_risk_score >= 3 && s.engine_suggested_risk_score <= 4
             ).length,
           },
         },
@@ -138,7 +138,6 @@ export async function GET() {
     }
 
     // ── Step 4: Insert one row per flagged supplier into agent_flagged_suppliers
-    // Only runs if we successfully got a run_id and have flagged suppliers.
     let supplierRowsInserted = 0;
 
     if (runRow?.id && highRiskFlagged.length > 0) {
@@ -146,7 +145,6 @@ export async function GET() {
         run_id: runRow.id,
         supplier_key: s.supplier_key,
         supplier_name: s.supplier_name,
-        // metrics: triggered metrics only, with full context for analyst review
         metrics: Array.isArray(s.metrics)
           ? s.metrics
               .filter((m) => Number(m?.score_contribution ?? 0) > 0)
@@ -159,7 +157,6 @@ export async function GET() {
                 explanation: m.explanation,
               }))
           : [],
-        // reasons: raw array of flag reason strings
         reasons: Array.isArray(s.flag_reasons) ? s.flag_reasons : [],
         overall_risk_score: s.engine_suggested_risk_score,
       }));

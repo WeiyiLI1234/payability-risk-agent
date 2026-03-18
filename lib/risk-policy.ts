@@ -1,9 +1,7 @@
-// lib/risk-policy.ts
-
-export const RISK_POLICY_VERSION = "v3.3.0";
+export const RISK_POLICY_VERSION = "v4.0.0";
 
 export const RISK_THRESHOLDS = {
-  receivableAnomaly: {
+  receivableSurge: {
     wowLow: 50,
     wowHigh: 100,
     wowCritical: 200,
@@ -13,26 +11,35 @@ export const RISK_THRESHOLDS = {
     histCritical: 8.0,
 
     // Absolute gates
-    // MEDIUM: today_receivable >= $3,000 AND (today - prev) >= $2,000
-    // HIGH / CRITICAL: today_receivable >= $5,000 AND (today - prev) >= $2,000
     minTodayReceivableMedium: 3_000,
     minTodayReceivableHighCrit: 5_000,
     minDeltaReceivable: 2_000,
   },
 
-  liabilityAnomaly: {
-    wowLow: 50,
-    wowHigh: 100,
-    wowCritical: 200,
+  receivableDrop: {
+    // Negative WoW change thresholds
+    wowMediumDropPct: 50, // <= -50%
+    wowHighDropPct: 70,   // <= -70%
 
-    histLow: 1.5,
-    histHigh: 2.8,
-    histCritical: 4.2,
+    // Relative-to-history thresholds
+    histMediumMaxRatio: 0.60,
+    histHighMaxRatio: 0.40,
 
-    // Absolute gates
-    // today_liability >= $10,000 AND absolute delta >= $5,000
-    minAbsLiability: 10_000,
-    minDeltaLiability: 5_000,
+    // Guards against tiny-volume noise
+    minPrevReceivable: 5_000,
+    minTrailingMedianReceivable: 3_000,
+  },
+
+  marketplacePaymentDelayDays: {
+    medium: 21,
+    high: 28,
+    critical: 35,
+  },
+
+  paymentDelayEligibility: {
+    recentTransactionWindowDays: 21,
+    minRecentTransactionCount: 2,
+    maxDaysSinceLatestTransaction: 14,
   },
 
   chargebackAnomaly: {
@@ -44,27 +51,19 @@ export const RISK_THRESHOLDS = {
     histHigh: 4.5,
     histCritical: 10.0,
 
-    // Absolute gates — at least one must be true
-    // MEDIUM: today_chargeback >= $200 OR delta_vs_median >= $200
-    // HIGH / CRITICAL: today_chargeback >= $500 OR delta_vs_median >= $200
+    // At least one must be true
     minChargebackAmountMedium: 200,
     minChargebackAmountHigh: 500,
     minChargebackDeltaVsMedian: 200,
   },
 
-  marketplacePaymentDelayDays: {
-    low: 14,
-    high: 21,
-    critical: 28,
-  },
-
   negativeNetEarning: {
-    low: -200,
-    high: -50_000,
+    medium: -500,
+    high: -10_000,
   },
 
   negativeAvailableBalance: {
-    medium: -100,    // loosened from -500 — catches earlier balance deterioration
+    medium: -500,
     high: -2_000,
     critical: -7_000,
   },
@@ -74,31 +73,14 @@ export const RISK_THRESHOLDS = {
     high: 0.25,
   },
 
-  // Active-supplier gate — used by payment-delay and chargeback metrics.
-  // A supplier is active if any one of these is true:
-  //   - had a marketplace payment within the last 30 days
-  //   - currently has a positive receivable
-  //   - outstanding balance >= $1,000
-  activeSupplier: {
-    maxDaysSincePayment: 30,
-    minOutstandingBal: 1_000,
-  },
-
-  // Reactivation suppression for MARKETPLACE_PAYMENT_DELAY.
-  // If the gap between the current record and the immediately preceding record
-  // exceeds this threshold (days), payment delay is suppressed because the long
-  // gap since last payment reflects dormancy, not a true delay.
-  reactivationGapDays: 90,
-
   // Scheme B: a supplier is only flagged when the engine score
   // maps to at least this risk level on the 1–10 scale.
-  // Lowered from 5 to 3 — allows single MEDIUM signals to produce a flag.
   minFlaggedRiskScore: 3,
 } as const;
 
 export const RISK_WEIGHTS = {
-  receivableAnomaly: 8,
-  liabilityAnomaly: 10,
+  receivableSurge: 8,
+  receivableDrop: 10,
   marketplacePaymentDelay: 12,
   chargebackAnomaly: 18,
   negativeNetEarning: 15,
