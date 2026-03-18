@@ -136,7 +136,7 @@ export async function getSupplierRiskInputData(
       SELECT *
       FROM supplier_history
       WHERE rn_desc = 1
-        AND liability >= 200  -- skip suppliers with today_liability < $200
+        AND liability > 50  -- skip suppliers with today_liability < $200
     ),
 
     trailing_6 AS (

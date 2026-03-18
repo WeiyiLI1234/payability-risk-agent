@@ -64,14 +64,12 @@ export const RISK_THRESHOLDS = {
   },
 
   negativeAvailableBalance: {
-    // LOW tier removed (was < 0)
-    medium: -500,
+    medium: -100,    // loosened from -500 — catches earlier balance deterioration
     high: -2_000,
     critical: -7_000,
   },
 
   dueFromSupplierPct: {
-    // LOW tier removed (was any > 0)
     medium: 0.10,
     high: 0.25,
   },
@@ -88,14 +86,14 @@ export const RISK_THRESHOLDS = {
 
   // Reactivation suppression for MARKETPLACE_PAYMENT_DELAY.
   // If the gap between the current record and the immediately preceding record
-  // exceeds this threshold (days), the supplier is considered recently reactivated
-  // after a dormant period. In that case, payment delay is suppressed because
-  // the long gap since the last payment reflects dormancy, not a true delay.
+  // exceeds this threshold (days), payment delay is suppressed because the long
+  // gap since last payment reflects dormancy, not a true delay.
   reactivationGapDays: 90,
 
   // Scheme B: a supplier is only flagged when the engine score
   // maps to at least this risk level on the 1–10 scale.
-  minFlaggedRiskScore: 5,
+  // Lowered from 5 to 3 — allows single MEDIUM signals to produce a flag.
+  minFlaggedRiskScore: 3,
 } as const;
 
 export const RISK_WEIGHTS = {
