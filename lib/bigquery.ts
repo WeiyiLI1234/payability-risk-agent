@@ -18,15 +18,18 @@ const bigquery = getBigQueryClient();
 /**
  * 增量入口：
  * 找出最近 N 天有新记录的 supplier。
- * 真正上生产时，最好改成基于 state table 的 last_run_time / max(latest_record_date)。
+ * Only returns suppliers with payability_status = 'Active'.
  */
 export async function getChangedSupplierKeys(daysBack = 2): Promise<string[]> {
   const query = `
-    SELECT DISTINCT supplier_key
-    FROM \`bigqueryexport-183608.PayabilitySheets.vm_transaction_summary\`
-    WHERE xact_post_date >= DATE_SUB(CURRENT_DATE(), INTERVAL @days_back DAY)
-      AND xact_post_date <= CURRENT_DATE()
-      AND supplier_key IS NOT NULL
+    SELECT DISTINCT t.supplier_key
+    FROM \`bigqueryexport-183608.PayabilitySheets.vm_transaction_summary\` t
+    INNER JOIN \`bigqueryexport-183608.PayabilitySheets.v_supplier_summary\` s
+      ON t.supplier_key = s.supplier_key
+    WHERE t.xact_post_date >= DATE_SUB(CURRENT_DATE(), INTERVAL @days_back DAY)
+      AND t.xact_post_date <= CURRENT_DATE()
+      AND t.supplier_key IS NOT NULL
+      AND s.payability_status = 'Active'
   `;
 
   const [rows] = await bigquery.query({
@@ -58,7 +61,7 @@ export async function getSupplierRiskInputData(
     -- Only include suppliers that are currently Active in v_supplier_summary.
     -- Suspended and Pending suppliers are excluded entirely from the risk engine.
     active_suppliers AS (
-      SELECT supplier_key
+      SELECT DISTINCT supplier_key
       FROM \`bigqueryexport-183608.PayabilitySheets.v_supplier_summary\`
       WHERE payability_status = 'Active'
     ),
