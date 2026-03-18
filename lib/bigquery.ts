@@ -16,8 +16,8 @@ function getBigQueryClient() {
 const bigquery = getBigQueryClient();
 
 /**
- * 增量入口：
- * 找出最近 N 天有新记录的 supplier。
+ * Incremental entry point:
+ * Find suppliers with new records in the last N days.
  * Only returns suppliers with payability_status = 'Active'.
  */
 export async function getChangedSupplierKeys(daysBack = 2): Promise<string[]> {
@@ -116,7 +116,19 @@ export async function getSupplierRiskInputData(
         LAG(due_from_supplier) OVER (
           PARTITION BY supplier_key
           ORDER BY xact_post_date
-        ) AS prev_due_from_supplier
+        ) AS prev_due_from_supplier,
+
+        -- Gap in days between current record and the immediately preceding record.
+        -- A large gap (e.g. > 90 days) indicates the supplier recently reactivated
+        -- after a dormant period, which should suppress payment delay flags.
+        DATE_DIFF(
+          xact_post_date,
+          LAG(xact_post_date) OVER (
+            PARTITION BY supplier_key
+            ORDER BY xact_post_date
+          ),
+          DAY
+        ) AS days_since_prev_record
       FROM base
     ),
 
@@ -124,7 +136,7 @@ export async function getSupplierRiskInputData(
       SELECT *
       FROM supplier_history
       WHERE rn_desc = 1
-        AND liability >= 1000  -- skip suppliers with today_liability < $1,000
+        AND liability >= 200  -- skip suppliers with today_liability < $200
     ),
 
     trailing_6 AS (
@@ -238,6 +250,8 @@ export async function getSupplierRiskInputData(
       l.due_from_supplier AS today_due_from_supplier,
       l.prev_due_from_supplier,
 
+      l.days_since_prev_record,
+
       CASE
         WHEN l.prev_receivable IS NULL OR l.prev_receivable = 0 THEN NULL
         ELSE ROUND(
@@ -304,8 +318,8 @@ export async function getSupplierRiskInputData(
 }
 
 /**
- * 兼容旧调用。
- * 若不传 supplierKeys，则拉全量最新状态。
+ * Compatibility shim for legacy callers.
+ * If no supplierKeys provided, fetches all suppliers' latest state.
  */
 export async function getDailyChangeData() {
   return getSupplierRiskInputData();

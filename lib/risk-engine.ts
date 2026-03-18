@@ -44,6 +44,10 @@ export type DailyChangeRow = {
 
   days_since_last_marketplace_payment?: number | null;
   historical_median_payment_gap_days?: number | null;
+
+  // Gap between the current record and the immediately preceding record (days).
+  // A large gap signals a recently reactivated account after dormancy.
+  days_since_prev_record?: number | null;
 };
 
 export type MetricResult = {
@@ -81,6 +85,7 @@ export type FlaggedSupplier = DailyChangeRow & {
   due_from_supplier_turned_positive: boolean;
 
   is_active_supplier: boolean;
+  is_recently_reactivated: boolean;
 
   metrics: MetricResult[];
   flag_reasons: string[];
@@ -169,6 +174,9 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
         ? null
         : safeNum(r.days_since_last_marketplace_payment);
 
+    const daysSincePrevRecord =
+      r.days_since_prev_record == null ? null : safeNum(r.days_since_prev_record);
+
     // ── Derived ratios ───────────────────────────────────────────────────────
     const receivableVsHistoryRatio = safeRatio(todayReceivable, trailingMedianReceivable ?? 0);
     const liabilityVsHistoryRatio = safeRatio(todayLiability, trailingMedianLiability ?? 0);
@@ -182,21 +190,23 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
 
     // ── Active-supplier gate ─────────────────────────────────────────────────
     // Applies to MARKETPLACE_PAYMENT_DELAY and CHARGEBACK_ANOMALY.
-    // A supplier is active if any one of these is true:
-    //   - had a marketplace payment within the last 30 days
-    //   - currently has a positive receivable
-    //   - outstanding balance >= $1 000
     const isActiveSupplier =
       todayReceivable > 0 ||
       (daysSinceLastMarketplacePayment !== null &&
         daysSinceLastMarketplacePayment <= RISK_THRESHOLDS.activeSupplier.maxDaysSincePayment) ||
       outstandingBal >= RISK_THRESHOLDS.activeSupplier.minOutstandingBal;
 
+    // ── Reactivation gate ─────────────────────────────────────────────────────
+    // If the gap between the current record and the immediately preceding record
+    // exceeds the threshold, the supplier recently resumed activity after dormancy.
+    // This suppresses MARKETPLACE_PAYMENT_DELAY, which would otherwise fire simply
+    // because the account was inactive for a long time — not because of a true delay.
+    const isRecentlyReactivated =
+      daysSincePrevRecord !== null &&
+      daysSincePrevRecord > RISK_THRESHOLDS.reactivationGapDays;
+
     // =========================================================================
     // 1) RECEIVABLE_ANOMALY
-    //    Gate: WoW % + vs-history ratio + ABSOLUTE materiality (per-tier)
-    //      MEDIUM:        today >= $3 000  AND  delta >= $2 000
-    //      HIGH/CRITICAL: today >= $5 000  AND  delta >= $2 000
     // =========================================================================
     const receivableDeltaAbsolute = todayReceivable - (prevReceivable ?? 0);
 
@@ -271,8 +281,6 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
 
     // =========================================================================
     // 2) LIABILITY_ANOMALY
-    //    Gate: WoW % + vs-history ratio + ABSOLUTE materiality
-    //      today_liability >= $10 000  AND  |delta| >= $5 000
     // =========================================================================
     const liabilityDeltaAbsolute = Math.abs(todayLiability - (prevLiability ?? 0));
 
@@ -343,14 +351,22 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
 
     // =========================================================================
     // 3) MARKETPLACE_PAYMENT_DELAY
-    //    Only evaluated for active suppliers.
-    //    Gate: isActiveSupplier
+    //    Skipped if:
+    //      - supplier is not active (isActiveSupplier = false)
+    //      - supplier recently reactivated after dormancy (isRecentlyReactivated = true)
     // =========================================================================
     let marketplace_payment_delay_flagged = false;
     let paymentDelaySeverity: MetricResult["severity"] = "NONE";
     let paymentDelayScore = 0;
+    let paymentDelayExplanation: string;
 
-    if (isActiveSupplier) {
+    if (!isActiveSupplier) {
+      paymentDelayExplanation =
+        "Marketplace payment delay check skipped — supplier does not meet active-supplier criteria.";
+    } else if (isRecentlyReactivated) {
+      paymentDelayExplanation =
+        `Marketplace payment delay check suppressed — supplier appears to have recently reactivated after a dormant period (${daysSincePrevRecord} day gap between records). The long time since last payment reflects inactivity, not a true delay.`;
+    } else {
       if (
         daysSinceLastMarketplacePayment !== null &&
         daysSinceLastMarketplacePayment > RISK_THRESHOLDS.marketplacePaymentDelayDays.critical
@@ -382,6 +398,11 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
           `Marketplace payment has not arrived for ${daysSinceLastMarketplacePayment} days, exceeding the expected two-week cadence.`
         );
       }
+
+      paymentDelayExplanation =
+        daysSinceLastMarketplacePayment === null
+          ? "Marketplace payment delay cannot be assessed because no historical positive payment was found."
+          : `It has been ${daysSinceLastMarketplacePayment} days since the last positive marketplace payment.`;
     }
 
     engineScore += paymentDelayScore;
@@ -389,11 +410,7 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
       metric_id: "MARKETPLACE_PAYMENT_DELAY",
       value: daysSinceLastMarketplacePayment,
       unit: "days",
-      explanation: !isActiveSupplier
-        ? "Marketplace payment delay check skipped — supplier does not meet active-supplier criteria."
-        : daysSinceLastMarketplacePayment === null
-        ? "Marketplace payment delay cannot be assessed because no historical positive payment was found."
-        : `It has been ${daysSinceLastMarketplacePayment} days since the last positive marketplace payment.`,
+      explanation: paymentDelayExplanation,
       severity: paymentDelaySeverity,
       score_contribution: paymentDelayScore,
       triggered: marketplace_payment_delay_flagged,
@@ -401,9 +418,7 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
 
     // =========================================================================
     // 4) CHARGEBACK_ANOMALY
-    //    Gate: isActiveSupplier + ratio + vs-history + ABSOLUTE amount
-    //      MEDIUM: today_chargeback >= $200  OR  delta_vs_median >= $200
-    //      HIGH / CRITICAL: today_chargeback >= $500  OR  delta_vs_median >= $200
+    //    Only evaluated for active suppliers.
     // =========================================================================
     const chargebackAbsGateMedium =
       todayChargeback >= RISK_THRESHOLDS.chargebackAnomaly.minChargebackAmountMedium ||
@@ -481,7 +496,6 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
 
     // =========================================================================
     // 5) NET_EARNING
-    //    Threshold lowered: MEDIUM triggers at <= -$200 (was -$5 000)
     // =========================================================================
     let net_earning_flagged = false;
     let netSeverity: MetricResult["severity"] = "NONE";
@@ -527,8 +541,7 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
     });
 
     // =========================================================================
-    // 6) AVAILABLE_BALANCE
-    //    LOW tier removed — minimum trigger is MEDIUM at <= -$500
+    // 6) AVAILABLE_BALANCE — minimum trigger is MEDIUM at <= -$500
     // =========================================================================
     let available_balance_flagged = false;
     let availSeverity: MetricResult["severity"] = "NONE";
@@ -550,7 +563,6 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
       availScore = Math.round(RISK_WEIGHTS.negativeAvailableBalance * 0.65);
       reasons.push(`Available balance is moderately negative at ${fmtMoney(todayAvail)}.`);
     }
-    // LOW tier (< 0 but > -500) intentionally removed
 
     engineScore += availScore;
     metrics.push({
@@ -564,9 +576,7 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
     });
 
     // =========================================================================
-    // 7) DUE_FROM_SUPPLIER
-    //    LOW tier removed — minimum trigger is MEDIUM at >= 10% of outstanding
-    //    "Turned positive" escalation kept as CRITICAL.
+    // 7) DUE_FROM_SUPPLIER — minimum trigger is MEDIUM at >= 10% of outstanding
     // =========================================================================
     let due_from_supplier_flagged = false;
     let dfsSeverity: MetricResult["severity"] = "NONE";
@@ -602,7 +612,6 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
         `Due from supplier is positive and accounts for ${(dueFromSupplierRatio * 100).toFixed(1)}% of outstanding exposure.`
       );
     }
-    // LOW tier (any > 0 below 10%) intentionally removed
 
     engineScore += dfsScore;
     metrics.push({
@@ -642,7 +651,8 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
       Number(todayAvail <= RISK_THRESHOLDS.negativeAvailableBalance.high) +
       Number(chargebackSeverity === "CRITICAL") +
       Number(
-        daysSinceLastMarketplacePayment !== null &&
+        !isRecentlyReactivated &&
+          daysSinceLastMarketplacePayment !== null &&
           daysSinceLastMarketplacePayment > RISK_THRESHOLDS.marketplacePaymentDelayDays.critical
       );
 
@@ -656,9 +666,6 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
     const engine_suggested_risk_score = mapEngineScore100ToRisk1to10(engine_score_100);
 
     // ── Scheme B: weak signals accumulate but cannot flag on their own ────────
-    // A supplier is only added to the flagged list when:
-    //   1. At least one metric actually triggered (has a signal)
-    //   2. The total score maps to risk_score >= minFlaggedRiskScore (default 5)
     const anyTriggered = metrics.some((m) => m.triggered);
     const isFlagged =
       anyTriggered &&
@@ -682,6 +689,7 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
       due_from_supplier_turned_positive: dueFromSupplierTurnedPositive,
 
       is_active_supplier: isActiveSupplier,
+      is_recently_reactivated: isRecentlyReactivated,
 
       metrics,
       flag_reasons: isFlagged ? reasons : [],
@@ -703,7 +711,6 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
     return safeNum(b.today_outstanding_bal) - safeNum(a.today_outstanding_bal);
   });
 
-  // flag_reasons is non-empty only when isFlagged (score >= 5 with a trigger)
   const flagged = scored.filter((x) => x.flag_reasons.length > 0);
   const unflagged = scored.filter((x) => x.flag_reasons.length === 0);
 
