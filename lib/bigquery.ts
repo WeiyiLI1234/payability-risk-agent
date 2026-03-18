@@ -294,6 +294,9 @@ export async function getSupplierRiskInputData(
       use_supplier_filter: useSupplierFilter,
       limit,
     },
+    types: {
+      supplier_keys: ["STRING"],
+    },
   });
 
   return rows;
