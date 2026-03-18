@@ -88,11 +88,12 @@ export async function getSupplierRiskInputData(
       FROM base
     ),
 
-    latest_row AS (
-      SELECT *
-      FROM supplier_history
-      WHERE rn_desc = 1
-    ),
+   latest_row AS (
+     SELECT *
+     FROM supplier_history
+     WHERE rn_desc = 1
+       AND liability >= 100
+  ),
 
     trailing_6 AS (
       SELECT
