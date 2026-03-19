@@ -10,11 +10,22 @@ import { RISK_THRESHOLDS } from "@/lib/risk-policy";
 
 type ConsolidatedRow = {
   supplier_key: string;
-  source: string;
   supplier_name: string | null;
-  latest_overall_risk_score: number | null;
-  times_flagged: number | null;
-  first_flagged_date: string | null;
+  metrics: any[] | null;
+  reasons: string[] | null;
+  overall_risk_score: number | null;
+  source: string;
+};
+
+type ChangeSummary = {
+  supplier_key: string;
+  change_type: "new" | "changed";
+  changed_fields: string[];
+  old_score: number | null;
+  new_score: number | null;
+  old_reasons: string[];
+  new_reasons: string[];
+  change_detail: string;
 };
 
 function buildDetailedMetrics(s: FlaggedSupplier) {
@@ -32,27 +43,66 @@ function buildDetailedMetrics(s: FlaggedSupplier) {
     : [];
 }
 
-function buildSimpleFlaggedOutput(flagged: FlaggedSupplier[], reportDate: string) {
+function normalizeReasons(reasons: unknown): string[] {
+  if (!Array.isArray(reasons)) return [];
+  return reasons
+    .map((r) => String(r ?? "").trim())
+    .filter(Boolean)
+    .sort((a, b) => a.localeCompare(b));
+}
+
+function reasonsChanged(oldReasons: unknown, newReasons: unknown): boolean {
+  const oldNorm = normalizeReasons(oldReasons);
+  const newNorm = normalizeReasons(newReasons);
+  return JSON.stringify(oldNorm) !== JSON.stringify(newNorm);
+}
+
+function scoreChanged(
+  oldScore: number | null | undefined,
+  newScore: number | null | undefined
+): boolean {
+  if (oldScore == null && newScore == null) return false;
+  return Number(oldScore ?? null) !== Number(newScore ?? null);
+}
+
+function buildChangeDetail(params: {
+  isNew: boolean;
+  oldScore: number | null;
+  newScore: number | null;
+  oldReasons: string[];
+  newReasons: string[];
+}): { changedFields: string[]; detail: string } {
+  const { isNew, oldScore, newScore, oldReasons, newReasons } = params;
+
+  if (isNew) {
+    return {
+      changedFields: ["new_supplier"],
+      detail: `New flagged supplier. Risk score = ${newScore ?? "N/A"}. Trigger reason = ${
+        newReasons.length > 0 ? newReasons.join("; ") : "N/A"
+      }.`,
+    };
+  }
+
+  const changedFields: string[] = [];
+  const parts: string[] = [];
+
+  if (scoreChanged(oldScore, newScore)) {
+    changedFields.push("overall_risk_score");
+    parts.push(`risk score changed from ${oldScore ?? "N/A"} to ${newScore ?? "N/A"}`);
+  }
+
+  if (reasonsChanged(oldReasons, newReasons)) {
+    changedFields.push("trigger_reason");
+    parts.push(
+      `trigger reason changed from [${
+        oldReasons.length > 0 ? oldReasons.join("; ") : "N/A"
+      }] to [${newReasons.length > 0 ? newReasons.join("; ") : "N/A"}]`
+    );
+  }
+
   return {
-    report_date: reportDate,
-    suppliers_reviewed: flagged.length,
-    suppliers: flagged.map((s) => ({
-      table_name: "vm_transaction_summary",
-      supplier_key: s.supplier_key,
-      supplier_name: s.supplier_name,
-      report_date: reportDate,
-      metrics: Array.isArray(s.metrics)
-        ? s.metrics
-            .filter((m) => Number(m?.score_contribution ?? 0) > 0)
-            .map((m) => ({
-              metric_id: m.metric_id,
-              value: m.value,
-              unit: m.unit,
-            }))
-        : [],
-      trigger_reason: Array.isArray(s.flag_reasons) ? s.flag_reasons.join(" ") : "",
-      overall_risk_score: s.engine_suggested_risk_score,
-    })),
+    changedFields,
+    detail: parts.length > 0 ? parts.join("; ") + "." : "No material change detected.",
   };
 }
 
@@ -63,14 +113,6 @@ function getPolicyVersion(
   return flagged[0]?.policy_version ?? unflagged[0]?.policy_version ?? null;
 }
 
-function scoreChanged(
-  oldScore: number | null | undefined,
-  newScore: number | null | undefined
-) {
-  if (oldScore == null && newScore == null) return false;
-  return Number(oldScore ?? null) !== Number(newScore ?? null);
-}
-
 export async function GET() {
   const start = Date.now();
   const reportDateIso = new Date().toISOString();
@@ -79,7 +121,7 @@ export async function GET() {
   try {
     console.log("[risk-report] START", reportDateIso);
 
-    // Step 1: Fetch supplier data from BigQuery
+    // Step 1: Fetch supplier data
     const rowsRaw = await getSupplierRiskInputData({ limit: 5000 });
     const rows = (Array.isArray(rowsRaw) ? rowsRaw : []) as DailyChangeRow[];
 
@@ -96,7 +138,6 @@ export async function GET() {
         changed_supplier_count: 0,
         supplier_rows_inserted: 0,
         consolidated_rows_upserted: 0,
-        returned_supplier_count: 0,
         report_date: reportDate,
         suppliers_reviewed: 0,
         suppliers: [],
@@ -120,7 +161,7 @@ export async function GET() {
     const sb = supabaseAdmin();
     const policyVersion = getPolicyVersion(result.flagged, result.unflagged);
 
-    // Step 3: Save one run row
+    // Step 3: Save one run summary row
     const { data: runRow, error: runError } = await sb
       .from("agent_run_daily_summary_report")
       .insert({
@@ -131,19 +172,6 @@ export async function GET() {
           duration_ms: Date.now() - start,
           policy_version: policyVersion,
           flagged_keys: highRiskFlagged.map((s) => s.supplier_key),
-          score_distribution: {
-            critical: highRiskFlagged.filter((s) => s.engine_suggested_risk_score >= 8).length,
-            high: highRiskFlagged.filter(
-              (s) =>
-                s.engine_suggested_risk_score >= 5 &&
-                s.engine_suggested_risk_score <= 7
-            ).length,
-            monitor: highRiskFlagged.filter(
-              (s) =>
-                s.engine_suggested_risk_score >= 3 &&
-                s.engine_suggested_risk_score <= 4
-            ).length,
-          },
         },
       })
       .select("id, created_at")
@@ -156,16 +184,14 @@ export async function GET() {
 
     console.log("[risk-report] run row saved", { run_id: runRow.id });
 
-    // Step 4: Read existing latest records from consolidated for this source
+    // Step 4: Read current consolidated rows for this source
     const flaggedKeys = highRiskFlagged.map((s) => s.supplier_key);
     let existingMap = new Map<string, ConsolidatedRow>();
 
     if (flaggedKeys.length > 0) {
       const { data: existingRows, error: existingError } = await sb
         .from("consolidated_flagged_supplier_list")
-        .select(
-          "supplier_key, source, supplier_name, latest_overall_risk_score, times_flagged, first_flagged_date"
-        )
+        .select("supplier_key, supplier_name, metrics, reasons, overall_risk_score, source")
         .eq("source", "daily_summary_report")
         .in("supplier_key", flaggedKeys);
 
@@ -181,11 +207,22 @@ export async function GET() {
       );
     }
 
-    // Step 5: Only keep NEW suppliers or suppliers whose risk score changed
+    // Step 5: Keep only NEW suppliers or suppliers whose score / reasons changed
     const changedFlaggedSuppliers = highRiskFlagged.filter((s) => {
       const existing = existingMap.get(s.supplier_key);
       if (!existing) return true;
-      return scoreChanged(existing.latest_overall_risk_score, s.engine_suggested_risk_score);
+
+      const scoreDiff = scoreChanged(
+        existing.overall_risk_score,
+        s.engine_suggested_risk_score
+      );
+
+      const reasonsDiff = reasonsChanged(
+        existing.reasons,
+        Array.isArray(s.flag_reasons) ? s.flag_reasons : []
+      );
+
+      return scoreDiff || reasonsDiff;
     });
 
     console.log("[risk-report] changed/new suppliers", {
@@ -198,15 +235,11 @@ export async function GET() {
     if (changedFlaggedSuppliers.length > 0) {
       const dailyRows = changedFlaggedSuppliers.map((s) => ({
         run_id: runRow.id,
-        report_date: reportDate,
-        source_table: "vm_transaction_summary",
         supplier_key: s.supplier_key,
         supplier_name: s.supplier_name,
         metrics: buildDetailedMetrics(s),
         reasons: Array.isArray(s.flag_reasons) ? s.flag_reasons : [],
-        trigger_reason: Array.isArray(s.flag_reasons) ? s.flag_reasons.join(" ") : "",
         overall_risk_score: s.engine_suggested_risk_score,
-        policy_version: s.policy_version ?? policyVersion,
         source: "daily_summary_report",
       }));
 
@@ -231,29 +264,15 @@ export async function GET() {
     let consolidatedRowsUpserted = 0;
 
     if (changedFlaggedSuppliers.length > 0) {
-      const consolidatedRows = changedFlaggedSuppliers.map((s) => {
-        const existing = existingMap.get(s.supplier_key);
-
-        return {
-          supplier_key: s.supplier_key,
-          source: "daily_summary_report",
-          supplier_name: s.supplier_name,
-          first_flagged_date: existing?.first_flagged_date ?? reportDate,
-          last_flagged_date: reportDate,
-          times_flagged: (existing?.times_flagged ?? 0) + 1,
-          latest_run_id: runRow.id,
-          latest_report_date: reportDate,
-          latest_overall_risk_score: s.engine_suggested_risk_score,
-          latest_metrics: buildDetailedMetrics(s),
-          latest_reasons: Array.isArray(s.flag_reasons) ? s.flag_reasons : [],
-          latest_trigger_reason: Array.isArray(s.flag_reasons)
-            ? s.flag_reasons.join(" ")
-            : "",
-          policy_version: s.policy_version ?? policyVersion,
-          source_table: "vm_transaction_summary",
-          updated_at: reportDateIso,
-        };
-      });
+      const consolidatedRows = changedFlaggedSuppliers.map((s) => ({
+        run_id: runRow.id,
+        supplier_key: s.supplier_key,
+        supplier_name: s.supplier_name,
+        metrics: buildDetailedMetrics(s),
+        reasons: Array.isArray(s.flag_reasons) ? s.flag_reasons : [],
+        overall_risk_score: s.engine_suggested_risk_score,
+        source: "daily_summary_report",
+      }));
 
       const { error: upsertError, count } = await sb
         .from("consolidated_flagged_supplier_list")
@@ -272,8 +291,59 @@ export async function GET() {
       consolidatedRowsUpserted = count ?? consolidatedRows.length;
     }
 
-    // Step 8: Return only changed/new suppliers
-    const simpleOutput = buildSimpleFlaggedOutput(changedFlaggedSuppliers, reportDate);
+    // Step 8: Build detailed change summary for API response
+    const supplierChanges: ChangeSummary[] = changedFlaggedSuppliers.map((s) => {
+      const existing = existingMap.get(s.supplier_key);
+      const oldReasons = normalizeReasons(existing?.reasons);
+      const newReasons = normalizeReasons(Array.isArray(s.flag_reasons) ? s.flag_reasons : []);
+
+      const summary = buildChangeDetail({
+        isNew: !existing,
+        oldScore: existing?.overall_risk_score ?? null,
+        newScore: s.engine_suggested_risk_score ?? null,
+        oldReasons,
+        newReasons,
+      });
+
+      return {
+        supplier_key: s.supplier_key,
+        change_type: existing ? "changed" : "new",
+        changed_fields: summary.changedFields,
+        old_score: existing?.overall_risk_score ?? null,
+        new_score: s.engine_suggested_risk_score ?? null,
+        old_reasons: oldReasons,
+        new_reasons: newReasons,
+        change_detail: summary.detail,
+      };
+    });
+
+    // Step 9: Return only changed/new suppliers, with change summary
+    const responseSuppliers = changedFlaggedSuppliers.map((s) => {
+      const change = supplierChanges.find((c) => c.supplier_key === s.supplier_key);
+
+      return {
+        table_name: "vm_transaction_summary",
+        supplier_key: s.supplier_key,
+        supplier_name: s.supplier_name,
+        report_date: reportDate,
+        metrics: Array.isArray(s.metrics)
+          ? s.metrics
+              .filter((m) => Number(m?.score_contribution ?? 0) > 0)
+              .map((m) => ({
+                metric_id: m.metric_id,
+                value: m.value,
+                unit: m.unit,
+              }))
+          : [],
+        trigger_reason: Array.isArray(s.flag_reasons) ? s.flag_reasons.join(" ") : "",
+        overall_risk_score: s.engine_suggested_risk_score,
+        change_type: change?.change_type ?? "changed",
+        changed_fields: change?.changed_fields ?? [],
+        change_detail: change?.change_detail ?? "",
+        previous_overall_risk_score: change?.old_score ?? null,
+        previous_trigger_reasons: change?.old_reasons ?? [],
+      };
+    });
 
     return NextResponse.json({
       run_id: runRow.id,
@@ -282,8 +352,9 @@ export async function GET() {
       changed_supplier_count: changedFlaggedSuppliers.length,
       supplier_rows_inserted: supplierRowsInserted,
       consolidated_rows_upserted: consolidatedRowsUpserted,
-      returned_supplier_count: simpleOutput.suppliers.length,
-      ...simpleOutput,
+      report_date: reportDate,
+      suppliers_reviewed: responseSuppliers.length,
+      suppliers: responseSuppliers,
     });
   } catch (error: any) {
     console.error("[risk-report] ERROR", error);
