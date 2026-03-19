@@ -33,6 +33,10 @@ export type DailyChangeRow = {
   trailing_median_receivable?: number | null;
   trailing_median_chargeback?: number | null;
 
+  last_activation_date?: string | null;
+  days_since_last_activation?: number | null;
+  has_payment_since_activation?: boolean | null;
+
   days_since_last_marketplace_payment?: number | null;
   historical_median_payment_gap_days?: number | null;
 
@@ -156,6 +160,11 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
     const recent3NetEarningSum =
       r.recent_3_net_earning_sum == null ? 0 : safeNum(r.recent_3_net_earning_sum);
 
+    const daysSinceLastActivation =
+      r.days_since_last_activation == null ? null : safeNum(r.days_since_last_activation);
+
+    const hasPaymentSinceActivation = Boolean(r.has_payment_since_activation);
+
     const daysSinceLastMarketplacePayment =
       r.days_since_last_marketplace_payment == null
         ? null
@@ -269,110 +278,146 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
     });
 
     // =========================================================================
+    // 2) RECEIVABLE_DROP
     // =========================================================================
-// 2) RECEIVABLE_DROP
-//    Standalone triggers:
-//    - sharp one-period drop
-//    - sustained down-streak
-//    "Below historical median" is only a confirming condition for HIGH,
-//    not a standalone trigger by itself.
-// =========================================================================
-const dropPctEligible =
-prevReceivable !== null &&
-prevReceivable >= RISK_THRESHOLDS.receivableDrop.minPrevReceivable &&
-receivablePct !== null;
+    const dropPctEligible =
+      prevReceivable !== null &&
+      prevReceivable >= RISK_THRESHOLDS.receivableDrop.minPrevReceivable &&
+      receivablePct !== null;
 
-const dropHistEligible =
-trailingMedianReceivable !== null &&
-trailingMedianReceivable >= RISK_THRESHOLDS.receivableDrop.minTrailingMedianReceivable &&
-receivableVsHistoryRatio !== null;
+    const dropHistEligible =
+      trailingMedianReceivable !== null &&
+      trailingMedianReceivable >= RISK_THRESHOLDS.receivableDrop.minTrailingMedianReceivable &&
+      receivableVsHistoryRatio !== null;
 
-// Sharp drop can trigger on its own
-const sharpDropHigh =
-dropPctEligible &&
-receivablePct! <= -RISK_THRESHOLDS.receivableDrop.wowHighDropPct &&
-dropHistEligible &&
-receivableVsHistoryRatio! <= 0.6;
+    const sharpDropHigh =
+      dropPctEligible &&
+      receivablePct! <= -RISK_THRESHOLDS.receivableDrop.wowHighDropPct &&
+      dropHistEligible &&
+      receivableVsHistoryRatio! <= 0.6;
 
-const sharpDropMedium =
-dropPctEligible &&
-receivablePct! <= -RISK_THRESHOLDS.receivableDrop.wowMediumDropPct;
+    const sharpDropMedium =
+      dropPctEligible &&
+      receivablePct! <= -RISK_THRESHOLDS.receivableDrop.wowMediumDropPct;
 
-// Sustained decrease can also trigger on its own
-const sustainedDropHigh =
-receivableDownStreak3 >= RISK_THRESHOLDS.receivableDrop.sustainedDownStreakHigh &&
-dropHistEligible &&
-receivableVsHistoryRatio! <= 0.8;
+    const sustainedDropHigh =
+      receivableDownStreak3 >= RISK_THRESHOLDS.receivableDrop.sustainedDownStreakHigh &&
+      dropHistEligible &&
+      receivableVsHistoryRatio! <= 0.8;
 
-const sustainedDropMedium =
-receivableDownStreak3 >= RISK_THRESHOLDS.receivableDrop.sustainedDownStreakMedium &&
-trailingMedianReceivable !== null &&
-trailingMedianReceivable >= RISK_THRESHOLDS.receivableDrop.minTrailingMedianReceivable;
+    const sustainedDropMedium =
+      receivableDownStreak3 >= RISK_THRESHOLDS.receivableDrop.sustainedDownStreakMedium &&
+      trailingMedianReceivable !== null &&
+      trailingMedianReceivable >= RISK_THRESHOLDS.receivableDrop.minTrailingMedianReceivable;
 
-let receivable_drop_flagged = false;
-let receivableDropSeverity: MetricResult["severity"] = "NONE";
-let receivableDropScore = 0;
+    let receivable_drop_flagged = false;
+    let receivableDropSeverity: MetricResult["severity"] = "NONE";
+    let receivableDropScore = 0;
 
-if (sharpDropHigh || sustainedDropHigh) {
-receivable_drop_flagged = true;
-receivableDropSeverity = "HIGH";
-receivableDropScore = RISK_WEIGHTS.receivableDrop;
-reasons.push(
-  `Receivables show material deterioration: latest change is ${
-    receivablePct === null ? "N/A" : fmtPct(receivablePct)
-  }, current level is ${
-    receivableVsHistoryRatio === null
-      ? "N/A"
-      : `${receivableVsHistoryRatio.toFixed(2)}x trailing median`
-  }, and recent down-streak count is ${receivableDownStreak3}.`
-);
-} else if (sharpDropMedium || sustainedDropMedium) {
-receivable_drop_flagged = true;
-receivableDropSeverity = "MEDIUM";
-receivableDropScore = Math.round(RISK_WEIGHTS.receivableDrop * 0.6);
-reasons.push(
-  `Receivables show deterioration: latest change is ${
-    receivablePct === null ? "N/A" : fmtPct(receivablePct)
-  }, and recent down-streak count is ${receivableDownStreak3}.`
-);
-}
+    if (sharpDropHigh || sustainedDropHigh) {
+      receivable_drop_flagged = true;
+      receivableDropSeverity = "HIGH";
+      receivableDropScore = RISK_WEIGHTS.receivableDrop;
+      reasons.push(
+        `Receivables show material deterioration: latest change is ${
+          receivablePct === null ? "N/A" : fmtPct(receivablePct)
+        }, current level is ${
+          receivableVsHistoryRatio === null
+            ? "N/A"
+            : `${receivableVsHistoryRatio.toFixed(2)}x trailing median`
+        }, and recent down-streak count is ${receivableDownStreak3}.`
+      );
+    } else if (sharpDropMedium || sustainedDropMedium) {
+      receivable_drop_flagged = true;
+      receivableDropSeverity = "MEDIUM";
+      receivableDropScore = Math.round(RISK_WEIGHTS.receivableDrop * 0.6);
+      reasons.push(
+        `Receivables show deterioration: latest change is ${
+          receivablePct === null ? "N/A" : fmtPct(receivablePct)
+        }, and recent down-streak count is ${receivableDownStreak3}.`
+      );
+    }
 
-engineScore += receivableDropScore;
-metrics.push({
-metric_id: "RECEIVABLE_DROP",
-value: receivablePct,
-unit: "%",
-explanation:
-  receivablePct === null && receivableVsHistoryRatio === null
-    ? "Receivable drop cannot be fully assessed because prior and historical baselines are unavailable."
-    : `Receivables changed by ${
-        receivablePct === null ? "N/A" : fmtPct(receivablePct)
-      }; current level is ${
-        receivableVsHistoryRatio === null
-          ? "N/A"
-          : `${receivableVsHistoryRatio.toFixed(2)}x trailing median`
-      }, and the recent down-streak count is ${receivableDownStreak3}.`,
-severity: receivableDropSeverity,
-score_contribution: receivableDropScore,
-triggered: receivable_drop_flagged,
-});
-
+    engineScore += receivableDropScore;
+    metrics.push({
+      metric_id: "RECEIVABLE_DROP",
+      value: receivablePct,
+      unit: "%",
+      explanation:
+        receivablePct === null && receivableVsHistoryRatio === null
+          ? "Receivable drop cannot be fully assessed because prior and historical baselines are unavailable."
+          : `Receivables changed by ${
+              receivablePct === null ? "N/A" : fmtPct(receivablePct)
+            }; current level is ${
+              receivableVsHistoryRatio === null
+                ? "N/A"
+                : `${receivableVsHistoryRatio.toFixed(2)}x trailing median`
+            }, and the recent down-streak count is ${receivableDownStreak3}.`,
+      severity: receivableDropSeverity,
+      score_contribution: receivableDropScore,
+      triggered: receivable_drop_flagged,
+    });
 
     // =========================================================================
     // 3) MARKETPLACE_PAYMENT_DELAY
+    //    Activation-aware:
+    //    - if there has been no payment since activation, judge delay from activation date
+    //    - once payment has appeared in the current activation cycle, judge from last payment date
     // =========================================================================
     let marketplace_payment_delay_flagged = false;
     let paymentDelaySeverity: MetricResult["severity"] = "NONE";
     let paymentDelayScore = 0;
     let paymentDelayExplanation: string;
+    let paymentDelayValue: number | null = null;
+    let paymentDelayBasis: "ACTIVATION" | "PAYMENT" | null = null;
 
     if (!hasRecentTransactionActivity) {
       paymentDelayExplanation =
         "Marketplace payment delay check skipped — supplier does not show recent sustained transaction activity.";
+    } else if (!hasPaymentSinceActivation) {
+      if (daysSinceLastActivation === null) {
+        paymentDelayExplanation =
+          "Marketplace payment delay cannot be assessed because activation date is unavailable.";
+      } else {
+        paymentDelayValue = daysSinceLastActivation;
+        paymentDelayBasis = "ACTIVATION";
+
+        if (daysSinceLastActivation > RISK_THRESHOLDS.marketplacePaymentDelayDays.critical) {
+          marketplace_payment_delay_flagged = true;
+          paymentDelaySeverity = "CRITICAL";
+          paymentDelayScore = RISK_WEIGHTS.marketplacePaymentDelay;
+          reasons.push(
+            `Marketplace payment appears severely delayed: supplier has been active for ${daysSinceLastActivation} days since the latest activation date, shows recent transaction activity, and still has no marketplace payment in the current activation cycle.`
+          );
+        } else if (
+          daysSinceLastActivation > RISK_THRESHOLDS.marketplacePaymentDelayDays.high
+        ) {
+          marketplace_payment_delay_flagged = true;
+          paymentDelaySeverity = "HIGH";
+          paymentDelayScore = Math.round(RISK_WEIGHTS.marketplacePaymentDelay * 0.7);
+          reasons.push(
+            `Marketplace payment delay is elevated: supplier has been active for ${daysSinceLastActivation} days since the latest activation date, shows recent transaction activity, and still has no marketplace payment in the current activation cycle.`
+          );
+        } else if (
+          daysSinceLastActivation > RISK_THRESHOLDS.marketplacePaymentDelayDays.medium
+        ) {
+          marketplace_payment_delay_flagged = true;
+          paymentDelaySeverity = "MEDIUM";
+          paymentDelayScore = Math.round(RISK_WEIGHTS.marketplacePaymentDelay * 0.45);
+          reasons.push(
+            `Marketplace payment has not arrived for ${daysSinceLastActivation} days since the latest activation date, even though recent transaction activity suggests one may be expected.`
+          );
+        }
+
+        paymentDelayExplanation = `Supplier has no marketplace payment since the latest activation date. It has been ${daysSinceLastActivation} days since activation, and recent transaction count in the last 21 days is ${transactionRecordsLast21d}.`;
+      }
     } else if (daysSinceLastMarketplacePayment === null) {
       paymentDelayExplanation =
-        "Marketplace payment delay cannot be assessed because no historical positive marketplace payment was found.";
+        "Marketplace payment delay cannot be assessed because last marketplace payment date is unavailable.";
     } else {
+      paymentDelayValue = daysSinceLastMarketplacePayment;
+      paymentDelayBasis = "PAYMENT";
+
       if (
         daysSinceLastMarketplacePayment >
         RISK_THRESHOLDS.marketplacePaymentDelayDays.critical
@@ -381,7 +426,7 @@ triggered: receivable_drop_flagged,
         paymentDelaySeverity = "CRITICAL";
         paymentDelayScore = RISK_WEIGHTS.marketplacePaymentDelay;
         reasons.push(
-          `Marketplace payment appears severely delayed at ${daysSinceLastMarketplacePayment} days since the last positive payment, despite recent transaction activity.`
+          `Marketplace payment appears severely delayed at ${daysSinceLastMarketplacePayment} days since the last positive payment in the current activation cycle, despite recent transaction activity.`
         );
       } else if (
         daysSinceLastMarketplacePayment >
@@ -391,7 +436,7 @@ triggered: receivable_drop_flagged,
         paymentDelaySeverity = "HIGH";
         paymentDelayScore = Math.round(RISK_WEIGHTS.marketplacePaymentDelay * 0.7);
         reasons.push(
-          `Marketplace payment delay is elevated at ${daysSinceLastMarketplacePayment} days since the last positive payment, despite recent transaction activity.`
+          `Marketplace payment delay is elevated at ${daysSinceLastMarketplacePayment} days since the last positive payment in the current activation cycle, despite recent transaction activity.`
         );
       } else if (
         daysSinceLastMarketplacePayment >
@@ -401,19 +446,24 @@ triggered: receivable_drop_flagged,
         paymentDelaySeverity = "MEDIUM";
         paymentDelayScore = Math.round(RISK_WEIGHTS.marketplacePaymentDelay * 0.45);
         reasons.push(
-          `Marketplace payment has not arrived for ${daysSinceLastMarketplacePayment} days even though recent transaction activity suggests one may be expected.`
+          `Marketplace payment has not arrived for ${daysSinceLastMarketplacePayment} days since the last positive payment in the current activation cycle, even though recent transaction activity suggests one may be expected.`
         );
       }
 
-      paymentDelayExplanation = `It has been ${daysSinceLastMarketplacePayment} days since the last positive marketplace payment. Recent transaction count in the last 21 days is ${transactionRecordsLast21d}.`;
+      paymentDelayExplanation = `Supplier already has marketplace payment in the current activation cycle. It has been ${daysSinceLastMarketplacePayment} days since the last positive marketplace payment, and recent transaction count in the last 21 days is ${transactionRecordsLast21d}.`;
     }
 
     engineScore += paymentDelayScore;
     metrics.push({
       metric_id: "MARKETPLACE_PAYMENT_DELAY",
-      value: daysSinceLastMarketplacePayment,
+      value: paymentDelayValue,
       unit: "days",
-      explanation: paymentDelayExplanation,
+      explanation:
+        paymentDelayBasis === "ACTIVATION"
+          ? `${paymentDelayExplanation} Delay is measured from the latest activation date because no payment has occurred since activation.`
+          : paymentDelayBasis === "PAYMENT"
+          ? `${paymentDelayExplanation} Delay is measured from the latest marketplace payment because payment has already occurred since activation.`
+          : paymentDelayExplanation,
       severity: paymentDelaySeverity,
       score_contribution: paymentDelayScore,
       triggered: marketplace_payment_delay_flagged,
@@ -611,11 +661,11 @@ triggered: receivable_drop_flagged,
 
     const turnedPositiveCritical =
       dueFromSupplierTurnedPositive &&
-      (todayDueFromSupplier >=
-        RISK_THRESHOLDS.dueFromSupplierTurnedPositive.criticalMinAmount ||
-        (dueFromSupplierRatio !== null &&
-          dueFromSupplierRatio >=
-            RISK_THRESHOLDS.dueFromSupplierTurnedPositive.criticalMinRatio));
+      todayDueFromSupplier >=
+        RISK_THRESHOLDS.dueFromSupplierTurnedPositive.criticalMinAmount &&
+      dueFromSupplierRatio !== null &&
+      dueFromSupplierRatio >=
+        RISK_THRESHOLDS.dueFromSupplierTurnedPositive.criticalMinRatio;
 
     if (turnedPositiveCritical) {
       due_from_supplier_flagged = true;
@@ -624,7 +674,9 @@ triggered: receivable_drop_flagged,
       reasons.push(
         `Due from supplier turned positive at ${fmtMoney(
           todayDueFromSupplier
-        )}, suggesting part of the exposure is no longer covered by marketplace remittance.`
+        )}, representing ${(safeNum(dueFromSupplierRatio) * 100).toFixed(
+          1
+        )}% of outstanding exposure and suggesting part of the exposure is no longer covered by marketplace remittance.`
       );
     } else if (dueFromSupplierTurnedPositive) {
       due_from_supplier_flagged = true;
@@ -633,7 +685,7 @@ triggered: receivable_drop_flagged,
       reasons.push(
         `Due from supplier turned positive at ${fmtMoney(
           todayDueFromSupplier
-        )}, but the amount remains small relative to the critical threshold.`
+        )}, but it does not yet meet the critical amount-and-ratio threshold.`
       );
     } else if (
       todayDueFromSupplier > 0 &&
@@ -704,12 +756,7 @@ triggered: receivable_drop_flagged,
       Number(streakCriticalEligible) +
       Number(todayAvail <= RISK_THRESHOLDS.negativeAvailableBalance.high) +
       Number(chargebackSeverity === "CRITICAL") +
-      Number(
-        hasRecentTransactionActivity &&
-          daysSinceLastMarketplacePayment !== null &&
-          daysSinceLastMarketplacePayment >
-            RISK_THRESHOLDS.marketplacePaymentDelayDays.critical
-      );
+      Number(paymentDelaySeverity === "CRITICAL");
 
     if (hardTriggerCount >= 2) {
       engineScore = Math.max(engineScore, 85);

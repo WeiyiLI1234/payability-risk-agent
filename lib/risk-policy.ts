@@ -1,4 +1,4 @@
-export const RISK_POLICY_VERSION = "v4.1.0";
+export const RISK_POLICY_VERSION = "v4.2.0";
 
 export const RISK_THRESHOLDS = {
   receivableSurge: {
@@ -16,12 +16,11 @@ export const RISK_THRESHOLDS = {
   },
 
   receivableDrop: {
-    // Any ONE of the following can trigger:
-    wowMediumDropPct: 50, // <= -50%
-    wowHighDropPct: 70,   // <= -70%
+    wowMediumDropPct: 50,
+    wowHighDropPct: 70,
 
-    histMediumMaxRatio: 0.60, // current <= 0.60x trailing median
-    histHighMaxRatio: 0.40,   // current <= 0.40x trailing median
+    histMediumMaxRatio: 0.60,
+    histHighMaxRatio: 0.40,
 
     minPrevReceivable: 5_000,
     minTrailingMedianReceivable: 3_000,
