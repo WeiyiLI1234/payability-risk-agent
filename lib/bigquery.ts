@@ -88,12 +88,12 @@ export async function getSupplierRiskInputData(
       FROM base
     ),
 
-   latest_row AS (
-     SELECT *
-     FROM supplier_history
-     WHERE rn_desc = 1
-       AND liability >= 100
-  ),
+    latest_row AS (
+      SELECT *
+      FROM supplier_history
+      WHERE rn_desc = 1
+        AND liability >= 100
+    ),
 
     trailing_6 AS (
       SELECT
@@ -128,10 +128,11 @@ export async function getSupplierRiskInputData(
       FROM base
     ),
 
-    negative_net_streak AS (
+    negative_net_stats AS (
       SELECT
         supplier_key,
-        COUNTIF(net_earning < 0) AS negative_net_earning_streak
+        COUNTIF(net_earning < 0) AS negative_net_earning_streak,
+        SUM(net_earning) AS recent_3_net_earning_sum
       FROM negative_streak_source
       WHERE rn <= 3
       GROUP BY supplier_key
@@ -258,7 +259,8 @@ export async function getSupplierRiskInputData(
       tm.trailing_median_receivable,
       tm.trailing_median_chargeback,
 
-      ns.negative_net_earning_streak,
+      nns.negative_net_earning_streak,
+      nns.recent_3_net_earning_sum,
 
       lp.last_marketplace_payment_date,
       DATE_DIFF(CURRENT_DATE(), lp.last_marketplace_payment_date, DAY) AS days_since_last_marketplace_payment,
@@ -273,8 +275,8 @@ export async function getSupplierRiskInputData(
     FROM latest_row l
     LEFT JOIN trailing_medians tm
       ON l.supplier_key = tm.supplier_key
-    LEFT JOIN negative_net_streak ns
-      ON l.supplier_key = ns.supplier_key
+    LEFT JOIN negative_net_stats nns
+      ON l.supplier_key = nns.supplier_key
     LEFT JOIN last_payment lp
       ON l.supplier_key = lp.supplier_key
     LEFT JOIN payment_gap_stats pgs

@@ -1,4 +1,4 @@
-export const RISK_POLICY_VERSION = "v4.0.0";
+export const RISK_POLICY_VERSION = "v4.1.0";
 
 export const RISK_THRESHOLDS = {
   receivableSurge: {
@@ -10,24 +10,24 @@ export const RISK_THRESHOLDS = {
     histHigh: 4.0,
     histCritical: 8.0,
 
-    // Absolute gates
     minTodayReceivableMedium: 3_000,
     minTodayReceivableHighCrit: 5_000,
     minDeltaReceivable: 2_000,
   },
 
   receivableDrop: {
-    // Negative WoW change thresholds
+    // Any ONE of the following can trigger:
     wowMediumDropPct: 50, // <= -50%
     wowHighDropPct: 70,   // <= -70%
 
-    // Relative-to-history thresholds
-    histMediumMaxRatio: 0.60,
-    histHighMaxRatio: 0.40,
+    histMediumMaxRatio: 0.60, // current <= 0.60x trailing median
+    histHighMaxRatio: 0.40,   // current <= 0.40x trailing median
 
-    // Guards against tiny-volume noise
     minPrevReceivable: 5_000,
     minTrailingMedianReceivable: 3_000,
+
+    sustainedDownStreakMedium: 2,
+    sustainedDownStreakHigh: 3,
   },
 
   marketplacePaymentDelayDays: {
@@ -51,7 +51,6 @@ export const RISK_THRESHOLDS = {
     histHigh: 4.5,
     histCritical: 10.0,
 
-    // At least one must be true
     minChargebackAmountMedium: 200,
     minChargebackAmountHigh: 500,
     minChargebackDeltaVsMedian: 200,
@@ -60,6 +59,7 @@ export const RISK_THRESHOLDS = {
   negativeNetEarning: {
     medium: -500,
     high: -10_000,
+    critical3PeriodSum: -1_000,
   },
 
   negativeAvailableBalance: {
@@ -73,8 +73,11 @@ export const RISK_THRESHOLDS = {
     high: 0.25,
   },
 
-  // Scheme B: a supplier is only flagged when the engine score
-  // maps to at least this risk level on the 1–10 scale.
+  dueFromSupplierTurnedPositive: {
+    criticalMinAmount: 100,
+    criticalMinRatio: 0.05,
+  },
+
   minFlaggedRiskScore: 3,
 } as const;
 

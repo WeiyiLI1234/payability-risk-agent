@@ -28,6 +28,7 @@ export type DailyChangeRow = {
   prev_due_from_supplier?: number | null;
 
   negative_net_earning_streak?: number | null;
+  recent_3_net_earning_sum?: number | null;
 
   trailing_median_receivable?: number | null;
   trailing_median_chargeback?: number | null;
@@ -122,7 +123,6 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
     const metrics: MetricResult[] = [];
     let engineScore = 0;
 
-    // ── Base values ──────────────────────────────────────────────────────────
     const todayReceivable = safeNum(r.today_receivable);
     const prevReceivable = r.prev_receivable === null ? null : safeNum(r.prev_receivable);
 
@@ -153,6 +153,9 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
     const negativeNetEarningStreak =
       r.negative_net_earning_streak == null ? 0 : safeNum(r.negative_net_earning_streak);
 
+    const recent3NetEarningSum =
+      r.recent_3_net_earning_sum == null ? 0 : safeNum(r.recent_3_net_earning_sum);
+
     const daysSinceLastMarketplacePayment =
       r.days_since_last_marketplace_payment == null
         ? null
@@ -167,7 +170,6 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
     const receivableDownStreak3 =
       r.receivable_down_streak_3 == null ? 0 : safeNum(r.receivable_down_streak_3);
 
-    // ── Derived ratios ───────────────────────────────────────────────────────
     const receivableVsHistoryRatio = safeRatio(todayReceivable, trailingMedianReceivable ?? 0);
     const chargebackVsHistoryRatio = safeRatio(todayChargeback, trailingMedianChargeback ?? 0);
     const chargebackDeltaVsMedian =
@@ -177,10 +179,6 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
     const dueFromSupplierTurnedPositive = todayDueFromSupplier > 0 && prevDueFromSupplier <= 0;
     const chargebackRatio = safeRatio(todayChargeback, todayReceivable);
 
-    // ── Activity gate for payment-delay evaluation ───────────────────────────
-    // We no longer special-case "reactivation".
-    // Instead, payment delay is only assessed when the supplier has evidence
-    // of recent, sustained transaction activity.
     const hasRecentTransactionActivity =
       transactionRecordsLast21d >=
         RISK_THRESHOLDS.paymentDelayEligibility.minRecentTransactionCount &&
@@ -271,90 +269,97 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
     });
 
     // =========================================================================
-    // 2) RECEIVABLE_DROP
-    //    Detects both sharp one-period drops and sustained multi-record declines.
     // =========================================================================
-    const receivableDropBaseEligible =
-      prevReceivable !== null &&
-      prevReceivable >= RISK_THRESHOLDS.receivableDrop.minPrevReceivable &&
-      trailingMedianReceivable !== null &&
-      trailingMedianReceivable >= RISK_THRESHOLDS.receivableDrop.minTrailingMedianReceivable &&
-      receivableVsHistoryRatio !== null &&
-      receivablePct !== null;
+// 2) RECEIVABLE_DROP
+//    Standalone triggers:
+//    - sharp one-period drop
+//    - sustained down-streak
+//    "Below historical median" is only a confirming condition for HIGH,
+//    not a standalone trigger by itself.
+// =========================================================================
+const dropPctEligible =
+prevReceivable !== null &&
+prevReceivable >= RISK_THRESHOLDS.receivableDrop.minPrevReceivable &&
+receivablePct !== null;
 
-    let receivable_drop_flagged = false;
-    let receivableDropSeverity: MetricResult["severity"] = "NONE";
-    let receivableDropScore = 0;
+const dropHistEligible =
+trailingMedianReceivable !== null &&
+trailingMedianReceivable >= RISK_THRESHOLDS.receivableDrop.minTrailingMedianReceivable &&
+receivableVsHistoryRatio !== null;
 
-    const sharpDropHigh =
-      receivableDropBaseEligible &&
-      receivablePct! <= -RISK_THRESHOLDS.receivableDrop.wowHighDropPct &&
-      receivableVsHistoryRatio! <= RISK_THRESHOLDS.receivableDrop.histHighMaxRatio;
+// Sharp drop can trigger on its own
+const sharpDropHigh =
+dropPctEligible &&
+receivablePct! <= -RISK_THRESHOLDS.receivableDrop.wowHighDropPct &&
+dropHistEligible &&
+receivableVsHistoryRatio! <= 0.6;
 
-    const sharpDropMedium =
-      receivableDropBaseEligible &&
-      receivablePct! <= -RISK_THRESHOLDS.receivableDrop.wowMediumDropPct &&
-      receivableVsHistoryRatio! <= RISK_THRESHOLDS.receivableDrop.histMediumMaxRatio;
+const sharpDropMedium =
+dropPctEligible &&
+receivablePct! <= -RISK_THRESHOLDS.receivableDrop.wowMediumDropPct;
 
-    const sustainedDropHigh =
-      trailingMedianReceivable !== null &&
-      trailingMedianReceivable >= RISK_THRESHOLDS.receivableDrop.minTrailingMedianReceivable &&
-      receivableVsHistoryRatio !== null &&
-      receivableDownStreak3 >= 3 &&
-      receivableVsHistoryRatio <= RISK_THRESHOLDS.receivableDrop.histHighMaxRatio;
+// Sustained decrease can also trigger on its own
+const sustainedDropHigh =
+receivableDownStreak3 >= RISK_THRESHOLDS.receivableDrop.sustainedDownStreakHigh &&
+dropHistEligible &&
+receivableVsHistoryRatio! <= 0.8;
 
-    const sustainedDropMedium =
-      trailingMedianReceivable !== null &&
-      trailingMedianReceivable >= RISK_THRESHOLDS.receivableDrop.minTrailingMedianReceivable &&
-      receivableVsHistoryRatio !== null &&
-      receivableDownStreak3 >= 3 &&
-      receivableVsHistoryRatio <= RISK_THRESHOLDS.receivableDrop.histMediumMaxRatio;
+const sustainedDropMedium =
+receivableDownStreak3 >= RISK_THRESHOLDS.receivableDrop.sustainedDownStreakMedium &&
+trailingMedianReceivable !== null &&
+trailingMedianReceivable >= RISK_THRESHOLDS.receivableDrop.minTrailingMedianReceivable;
 
-    if (sharpDropHigh || sustainedDropHigh) {
-      receivable_drop_flagged = true;
-      receivableDropSeverity = "HIGH";
-      receivableDropScore = RISK_WEIGHTS.receivableDrop;
-      reasons.push(
-        `Receivables deteriorated materially: latest receivables are down ${fmtPct(
-          Math.abs(receivablePct ?? 0)
-        )} versus the previous record and sit at ${receivableVsHistoryRatio?.toFixed(
-          2
-        )}x trailing median.`
-      );
-    } else if (sharpDropMedium || sustainedDropMedium) {
-      receivable_drop_flagged = true;
-      receivableDropSeverity = "MEDIUM";
-      receivableDropScore = Math.round(RISK_WEIGHTS.receivableDrop * 0.6);
-      reasons.push(
-        `Receivables show deterioration: latest receivables are down ${fmtPct(
-          Math.abs(receivablePct ?? 0)
-        )} versus the previous record and remain below normal history.`
-      );
-    }
+let receivable_drop_flagged = false;
+let receivableDropSeverity: MetricResult["severity"] = "NONE";
+let receivableDropScore = 0;
 
-    engineScore += receivableDropScore;
-    metrics.push({
-      metric_id: "RECEIVABLE_DROP",
-      value: receivablePct,
-      unit: "%",
-      explanation:
-        receivablePct === null
-          ? "Receivable drop cannot be assessed because prior record is unavailable."
-          : receivableVsHistoryRatio === null
-          ? `Receivables changed by ${fmtPct(receivablePct)}, but historical baseline is unavailable.`
-          : `Receivables changed by ${fmtPct(
-              receivablePct
-            )}; current level is ${receivableVsHistoryRatio.toFixed(
-              2
-            )}x trailing median, and the recent down-streak count is ${receivableDownStreak3}.`,
-      severity: receivableDropSeverity,
-      score_contribution: receivableDropScore,
-      triggered: receivable_drop_flagged,
-    });
+if (sharpDropHigh || sustainedDropHigh) {
+receivable_drop_flagged = true;
+receivableDropSeverity = "HIGH";
+receivableDropScore = RISK_WEIGHTS.receivableDrop;
+reasons.push(
+  `Receivables show material deterioration: latest change is ${
+    receivablePct === null ? "N/A" : fmtPct(receivablePct)
+  }, current level is ${
+    receivableVsHistoryRatio === null
+      ? "N/A"
+      : `${receivableVsHistoryRatio.toFixed(2)}x trailing median`
+  }, and recent down-streak count is ${receivableDownStreak3}.`
+);
+} else if (sharpDropMedium || sustainedDropMedium) {
+receivable_drop_flagged = true;
+receivableDropSeverity = "MEDIUM";
+receivableDropScore = Math.round(RISK_WEIGHTS.receivableDrop * 0.6);
+reasons.push(
+  `Receivables show deterioration: latest change is ${
+    receivablePct === null ? "N/A" : fmtPct(receivablePct)
+  }, and recent down-streak count is ${receivableDownStreak3}.`
+);
+}
+
+engineScore += receivableDropScore;
+metrics.push({
+metric_id: "RECEIVABLE_DROP",
+value: receivablePct,
+unit: "%",
+explanation:
+  receivablePct === null && receivableVsHistoryRatio === null
+    ? "Receivable drop cannot be fully assessed because prior and historical baselines are unavailable."
+    : `Receivables changed by ${
+        receivablePct === null ? "N/A" : fmtPct(receivablePct)
+      }; current level is ${
+        receivableVsHistoryRatio === null
+          ? "N/A"
+          : `${receivableVsHistoryRatio.toFixed(2)}x trailing median`
+      }, and the recent down-streak count is ${receivableDownStreak3}.`,
+severity: receivableDropSeverity,
+score_contribution: receivableDropScore,
+triggered: receivable_drop_flagged,
+});
+
 
     // =========================================================================
     // 3) MARKETPLACE_PAYMENT_DELAY
-    //    Only evaluated when there is recent, sustained transaction activity.
     // =========================================================================
     let marketplace_payment_delay_flagged = false;
     let paymentDelaySeverity: MetricResult["severity"] = "NONE";
@@ -519,19 +524,31 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
       reasons.push(`Net earning is negative at ${fmtMoney(computedNetEarning)}.`);
     }
 
-    if (negativeNetEarningStreak >= 3) {
+    const streakHighEligible =
+      negativeNetEarningStreak >= 2 &&
+      computedNetEarning <= RISK_THRESHOLDS.negativeNetEarning.medium;
+
+    const streakCriticalEligible =
+      negativeNetEarningStreak >= 3 &&
+      recent3NetEarningSum < RISK_THRESHOLDS.negativeNetEarning.critical3PeriodSum;
+
+    if (streakCriticalEligible) {
       net_earning_flagged = true;
       netSeverity = "CRITICAL";
       netScore = Math.max(netScore, RISK_WEIGHTS.negativeNetEarning + 8);
       reasons.push(
-        `Net earning has been negative for ${negativeNetEarningStreak} consecutive recent records.`
+        `Net earning has been negative for ${negativeNetEarningStreak} consecutive recent records, and the recent 3-period cumulative net earning is ${fmtMoney(
+          recent3NetEarningSum
+        )}.`
       );
-    } else if (negativeNetEarningStreak >= 2) {
+    } else if (streakHighEligible) {
       net_earning_flagged = true;
       netSeverity = "HIGH";
       netScore = Math.max(netScore, RISK_WEIGHTS.negativeNetEarning);
       reasons.push(
-        `Net earning has been negative for ${negativeNetEarningStreak} consecutive recent records.`
+        `Net earning has been negative for ${negativeNetEarningStreak} consecutive recent records, and the latest net earning is ${fmtMoney(
+          computedNetEarning
+        )}.`
       );
     }
 
@@ -542,7 +559,9 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
       unit: "$",
       explanation: `Net earning is ${fmtMoney(computedNetEarning)} (${fmtMoney(
         todayReceivable
-      )} receivables minus ${fmtMoney(todayChargeback)} chargebacks).`,
+      )} receivables minus ${fmtMoney(todayChargeback)} chargebacks). Recent 3-period cumulative net earning is ${fmtMoney(
+        recent3NetEarningSum
+      )}.`,
       severity: netSeverity,
       score_contribution: netScore,
       triggered: net_earning_flagged,
@@ -590,7 +609,15 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
     let dfsSeverity: MetricResult["severity"] = "NONE";
     let dfsScore = 0;
 
-    if (dueFromSupplierTurnedPositive) {
+    const turnedPositiveCritical =
+      dueFromSupplierTurnedPositive &&
+      (todayDueFromSupplier >=
+        RISK_THRESHOLDS.dueFromSupplierTurnedPositive.criticalMinAmount ||
+        (dueFromSupplierRatio !== null &&
+          dueFromSupplierRatio >=
+            RISK_THRESHOLDS.dueFromSupplierTurnedPositive.criticalMinRatio));
+
+    if (turnedPositiveCritical) {
       due_from_supplier_flagged = true;
       dfsSeverity = "CRITICAL";
       dfsScore = RISK_WEIGHTS.dueFromSupplierPositive + 6;
@@ -598,6 +625,15 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
         `Due from supplier turned positive at ${fmtMoney(
           todayDueFromSupplier
         )}, suggesting part of the exposure is no longer covered by marketplace remittance.`
+      );
+    } else if (dueFromSupplierTurnedPositive) {
+      due_from_supplier_flagged = true;
+      dfsSeverity = "HIGH";
+      dfsScore = RISK_WEIGHTS.dueFromSupplierPositive;
+      reasons.push(
+        `Due from supplier turned positive at ${fmtMoney(
+          todayDueFromSupplier
+        )}, but the amount remains small relative to the critical threshold.`
       );
     } else if (
       todayDueFromSupplier > 0 &&
@@ -648,7 +684,7 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
     });
 
     // =========================================================================
-    // 8) OUTSTANDING_EXPOSURE — context only, no score contribution
+    // 8) OUTSTANDING_EXPOSURE
     // =========================================================================
     metrics.push({
       metric_id: "OUTSTANDING_EXPOSURE",
@@ -664,8 +700,8 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
 
     // ── Hard escalation floor ─────────────────────────────────────────────────
     const hardTriggerCount =
-      Number(dueFromSupplierTurnedPositive) +
-      Number(negativeNetEarningStreak >= 3) +
+      Number(turnedPositiveCritical) +
+      Number(streakCriticalEligible) +
       Number(todayAvail <= RISK_THRESHOLDS.negativeAvailableBalance.high) +
       Number(chargebackSeverity === "CRITICAL") +
       Number(
@@ -684,7 +720,6 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
     const engine_score_100 = clamp100(engineScore);
     const engine_suggested_risk_score = mapEngineScore100ToRisk1to10(engine_score_100);
 
-    // ── Scheme B: weak signals accumulate but cannot flag on their own ────────
     const anyTriggered = metrics.some((m) => m.triggered);
     const isFlagged =
       anyTriggered &&
@@ -717,7 +752,6 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
     };
   });
 
-  // ── Sort: risk score → engine score → outstanding balance ──────────────────
   scored.sort((a, b) => {
     if (b.engine_suggested_risk_score !== a.engine_suggested_risk_score) {
       return b.engine_suggested_risk_score - a.engine_suggested_risk_score;
