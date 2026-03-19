@@ -23,6 +23,10 @@ type GetSupplierRiskInputOptions = {
  * - Universe = suppliers currently marked Active in v_supplier_summary
  * - No incremental pre-filter on "recent transaction activity"
  * - Latest snapshot + trailing history features are all computed here
+ * - Payment delay is activation-aware:
+ *   - if there has been no marketplace payment since the latest activation date,
+ *     use days_since_last_activation
+ *   - otherwise use days_since_last_marketplace_payment
  */
 export async function getSupplierRiskInputData(
   options: GetSupplierRiskInputOptions = {}
@@ -46,6 +50,18 @@ export async function getSupplierRiskInputData(
           @use_supplier_filter = FALSE
           OR supplier_key IN (SELECT supplier_key FROM target_suppliers)
         )
+    ),
+
+    activation_dates AS (
+      SELECT
+        ss.supplier_key,
+        MAX(COALESCE(r.reactivation_date, ss.first_purchase_date)) AS last_activation_date
+      FROM \`bigqueryexport-183608.PayabilitySheets.v_supplier_summary\` ss
+      LEFT JOIN \`bigqueryexport-183608.daniel_sandbox.reactivations\` r
+        USING (supplier_key)
+      INNER JOIN active_suppliers a
+        ON ss.supplier_key = a.supplier_key
+      GROUP BY ss.supplier_key
     ),
 
     base AS (
@@ -180,6 +196,29 @@ export async function getSupplierRiskInputData(
       WHERE payment_rn_desc = 1
     ),
 
+    payment_since_activation AS (
+      SELECT
+        ad.supplier_key,
+        COUNTIF(
+          b.marketplace_payment > 0
+          AND ad.last_activation_date IS NOT NULL
+          AND b.xact_post_date >= ad.last_activation_date
+        ) AS payment_count_since_activation,
+        MAX(
+          CASE
+            WHEN b.marketplace_payment > 0
+              AND ad.last_activation_date IS NOT NULL
+              AND b.xact_post_date >= ad.last_activation_date
+            THEN b.xact_post_date
+            ELSE NULL
+          END
+        ) AS last_payment_since_activation_date
+      FROM activation_dates ad
+      LEFT JOIN base b
+        ON ad.supplier_key = b.supplier_key
+      GROUP BY ad.supplier_key
+    ),
+
     transaction_activity AS (
       SELECT
         supplier_key,
@@ -262,6 +301,12 @@ export async function getSupplierRiskInputData(
       nns.negative_net_earning_streak,
       nns.recent_3_net_earning_sum,
 
+      ad.last_activation_date,
+      DATE_DIFF(CURRENT_DATE(), ad.last_activation_date, DAY) AS days_since_last_activation,
+
+      IFNULL(psa.payment_count_since_activation, 0) > 0 AS has_payment_since_activation,
+      psa.last_payment_since_activation_date,
+
       lp.last_marketplace_payment_date,
       DATE_DIFF(CURRENT_DATE(), lp.last_marketplace_payment_date, DAY) AS days_since_last_marketplace_payment,
       pgs.historical_median_payment_gap_days,
@@ -277,6 +322,10 @@ export async function getSupplierRiskInputData(
       ON l.supplier_key = tm.supplier_key
     LEFT JOIN negative_net_stats nns
       ON l.supplier_key = nns.supplier_key
+    LEFT JOIN activation_dates ad
+      ON l.supplier_key = ad.supplier_key
+    LEFT JOIN payment_since_activation psa
+      ON l.supplier_key = psa.supplier_key
     LEFT JOIN last_payment lp
       ON l.supplier_key = lp.supplier_key
     LEFT JOIN payment_gap_stats pgs
