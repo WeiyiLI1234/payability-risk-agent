@@ -30,7 +30,7 @@ export const RISK_THRESHOLDS = {
   },
 
   amazonOrderActivityDrop: {
-    maxDaysSinceLatestOrderData: 14,
+    maxDaysSinceLatestOrderData: 21,
 
     wowMediumDropPct: 50,
     wowHighDropPct: 70,
