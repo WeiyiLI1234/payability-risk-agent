@@ -44,17 +44,19 @@ export async function getSupplierRiskInputData(
     ),
 
     active_suppliers AS (
-      SELECT DISTINCT
-        supplier_key,
-        sales_channel
-      FROM \`bigqueryexport-183608.PayabilitySheets.v_supplier_summary\`
-      WHERE payability_status = 'Active'
-        AND supplier_key IS NOT NULL
-        AND (
-          @use_supplier_filter = FALSE
-          OR supplier_key IN (SELECT supplier_key FROM target_suppliers)
-        )
-    ),
+  SELECT DISTINCT
+    ss.supplier_key,
+    ms.sales_channel
+  FROM \`bigqueryexport-183608.PayabilitySheets.v_supplier_summary\` ss
+  LEFT JOIN \`bigqueryexport-183608.PayabilitySheets.marketplace_supplier\` ms
+    USING (supplier_key)
+  WHERE ss.payability_status = 'Active'
+    AND ss.supplier_key IS NOT NULL
+    AND (
+      @use_supplier_filter = FALSE
+      OR ss.supplier_key IN (SELECT supplier_key FROM target_suppliers)
+    )
+),
 
     activation_dates AS (
       SELECT
