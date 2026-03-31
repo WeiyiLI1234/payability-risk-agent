@@ -195,7 +195,6 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
     const receivableDownStreak3 =
       r.receivable_down_streak_3 == null ? 0 : safeNum(r.receivable_down_streak_3);
 
-    // Amazon order fields
     const latestAmazonOrdersPurchased =
       r.latest_amazon_orders_purchased == null ? null : safeNum(r.latest_amazon_orders_purchased);
     const prevAmazonOrdersPurchased =
@@ -402,7 +401,6 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
 
     // =========================================================================
     // 3) ORDER_ACTIVITY_DROP (Amazon-only supplemental metric)
-    //    Missing or stale order data is ignored, not flagged.
     // =========================================================================
     const amazonOrderCountChangePct =
       latestAmazonOrdersPurchased === null ||
@@ -460,16 +458,14 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
           amazonOrderCountChangePct <=
             -RISK_THRESHOLDS.amazonOrderActivityDrop.wowHighDropPct &&
           amazonOrderCountVsHistoryRatio !== null &&
-          amazonOrderCountVsHistoryRatio <=
-            RISK_THRESHOLDS.amazonOrderActivityDrop.histHighMaxRatio
+          amazonOrderCountVsHistoryRatio <= 0.6
         ) ||
         (
           amazonOrderValueChangePct !== null &&
           amazonOrderValueChangePct <=
             -RISK_THRESHOLDS.amazonOrderActivityDrop.wowHighDropPct &&
           amazonOrderValueVsHistoryRatio !== null &&
-          amazonOrderValueVsHistoryRatio <=
-            RISK_THRESHOLDS.amazonOrderActivityDrop.histHighMaxRatio
+          amazonOrderValueVsHistoryRatio <= 0.6
         ) ||
         (
           amazonOrderValueDownStreak3 >=
@@ -490,28 +486,16 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
         (
           amazonOrderCountChangePct !== null &&
           amazonOrderCountChangePct <=
-            -RISK_THRESHOLDS.amazonOrderActivityDrop.wowMediumDropPct &&
-          amazonOrderCountVsHistoryRatio !== null &&
-          amazonOrderCountVsHistoryRatio <=
-            RISK_THRESHOLDS.amazonOrderActivityDrop.histMediumMaxRatio
+            -RISK_THRESHOLDS.amazonOrderActivityDrop.wowMediumDropPct
         ) ||
         (
           amazonOrderValueChangePct !== null &&
           amazonOrderValueChangePct <=
-            -RISK_THRESHOLDS.amazonOrderActivityDrop.wowMediumDropPct &&
-          amazonOrderValueVsHistoryRatio !== null &&
-          amazonOrderValueVsHistoryRatio <=
-            RISK_THRESHOLDS.amazonOrderActivityDrop.histMediumMaxRatio
+            -RISK_THRESHOLDS.amazonOrderActivityDrop.wowMediumDropPct
         ) ||
         (
           amazonOrderValueDownStreak3 >=
-            RISK_THRESHOLDS.amazonOrderActivityDrop.sustainedDownStreakMedium &&
-          (
-            (amazonOrderValueVsHistoryRatio !== null &&
-              amazonOrderValueVsHistoryRatio <= 0.9) ||
-            (amazonOrderCountVsHistoryRatio !== null &&
-              amazonOrderCountVsHistoryRatio <= 0.9)
-          )
+            RISK_THRESHOLDS.amazonOrderActivityDrop.sustainedDownStreakMedium
         )
       );
 
@@ -531,30 +515,42 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
       orderActivitySeverity = "HIGH";
       orderActivityScore = RISK_WEIGHTS.amazonOrderActivityDrop;
       reasons.push(
-        `Amazon order activity shows material deterioration: latest order-day activity is down versus both the previous observed order day and trailing order history.`
+        `Amazon order activity shows material deterioration: latest order-day activity is down sharply or has been declining consistently relative to recent order history.`
       );
       orderActivityExplanation = `Latest Amazon order activity shows deterioration. Latest order count is ${
         latestAmazonOrdersPurchased === null ? "N/A" : latestAmazonOrdersPurchased
       }, latest order GMV is ${
         latestAmazonTotalOrdersPrice === null ? "N/A" : fmtMoney(latestAmazonTotalOrdersPrice)
+      }, latest order-count change is ${
+        amazonOrderCountChangePct === null ? "N/A" : fmtPct(amazonOrderCountChangePct)
+      }, latest order-value change is ${
+        amazonOrderValueChangePct === null ? "N/A" : fmtPct(amazonOrderValueChangePct)
       }, and the recent Amazon order-value down-streak count is ${amazonOrderValueDownStreak3}.`;
     } else if (orderDropMedium) {
       order_activity_drop_flagged = true;
       orderActivitySeverity = "MEDIUM";
       orderActivityScore = Math.round(RISK_WEIGHTS.amazonOrderActivityDrop * 0.6);
       reasons.push(
-        `Amazon order activity shows weakening: latest order-day activity is down relative to recent order history.`
+        `Amazon order activity shows weakening: latest order-day activity has declined relative to recent order history.`
       );
       orderActivityExplanation = `Latest Amazon order activity shows weakening. Latest order count is ${
         latestAmazonOrdersPurchased === null ? "N/A" : latestAmazonOrdersPurchased
       }, latest order GMV is ${
         latestAmazonTotalOrdersPrice === null ? "N/A" : fmtMoney(latestAmazonTotalOrdersPrice)
+      }, latest order-count change is ${
+        amazonOrderCountChangePct === null ? "N/A" : fmtPct(amazonOrderCountChangePct)
+      }, latest order-value change is ${
+        amazonOrderValueChangePct === null ? "N/A" : fmtPct(amazonOrderValueChangePct)
       }, and the recent Amazon order-value down-streak count is ${amazonOrderValueDownStreak3}.`;
     } else {
       orderActivityExplanation = `Amazon order activity is available and does not currently show a material drop. Latest order count is ${
         latestAmazonOrdersPurchased === null ? "N/A" : latestAmazonOrdersPurchased
       }, latest order GMV is ${
         latestAmazonTotalOrdersPrice === null ? "N/A" : fmtMoney(latestAmazonTotalOrdersPrice)
+      }, latest order-count change is ${
+        amazonOrderCountChangePct === null ? "N/A" : fmtPct(amazonOrderCountChangePct)
+      }, latest order-value change is ${
+        amazonOrderValueChangePct === null ? "N/A" : fmtPct(amazonOrderValueChangePct)
       }, and the recent Amazon order-value down-streak count is ${amazonOrderValueDownStreak3}.`;
     }
 

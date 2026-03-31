@@ -10,6 +10,7 @@ export const RISK_THRESHOLDS = {
     histHigh: 4.0,
     histCritical: 8.0,
 
+    // Absolute gates
     minTodayReceivableMedium: 3_000,
     minTodayReceivableHighCrit: 5_000,
     minDeltaReceivable: 2_000,
@@ -30,7 +31,8 @@ export const RISK_THRESHOLDS = {
   },
 
   amazonOrderActivityDrop: {
-    maxDaysSinceLatestOrderData: 21,
+    // Only assess when recent Amazon order data is available and not stale
+    maxDaysSinceLatestOrderData: 14,
 
     wowMediumDropPct: 50,
     wowHighDropPct: 70,
@@ -69,6 +71,7 @@ export const RISK_THRESHOLDS = {
     histHigh: 4.5,
     histCritical: 10.0,
 
+    // At least one must be true
     minChargebackAmountMedium: 200,
     minChargebackAmountHigh: 500,
     minChargebackDeltaVsMedian: 200,

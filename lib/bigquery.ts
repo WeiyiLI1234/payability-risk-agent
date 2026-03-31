@@ -27,6 +27,8 @@ type GetSupplierRiskInputOptions = {
  *   - if there has been no marketplace payment since the latest activation date,
  *     use days_since_last_activation
  *   - otherwise use days_since_last_marketplace_payment
+ * - Amazon order-day activity is brought in as a supplemental signal only;
+ *   missing / stale order data should not itself be treated as risk
  */
 export async function getSupplierRiskInputData(
   options: GetSupplierRiskInputOptions = {}
@@ -42,7 +44,9 @@ export async function getSupplierRiskInputData(
     ),
 
     active_suppliers AS (
-      SELECT DISTINCT supplier_key
+      SELECT DISTINCT
+        supplier_key,
+        sales_channel
       FROM \`bigqueryexport-183608.PayabilitySheets.v_supplier_summary\`
       WHERE payability_status = 'Active'
         AND supplier_key IS NOT NULL
@@ -68,6 +72,7 @@ export async function getSupplierRiskInputData(
       SELECT
         t.supplier_key,
         t.supplier_name,
+        a.sales_channel,
         t.xact_post_date,
 
         IFNULL(t.receivable, 0) AS receivable,
@@ -266,11 +271,116 @@ export async function getSupplierRiskInputData(
           ELSE 0
         END AS receivable_down_streak_3
       FROM receivable_trend_raw
+    ),
+
+    amazon_orders AS (
+      SELECT
+        ss.supplier_key,
+        purchase_day AS order_day,
+        COUNT(DISTINCT CASE WHEN order_status != 'Cancelled' THEN amazon_order_id END) AS amazon_orders_purchased,
+        SUM(CASE WHEN order_status != 'Cancelled' THEN item_price END) AS amazon_total_orders_price
+      FROM \`bigqueryexport-183608.amazon.customer_order_metrics\` com
+      JOIN \`bigqueryexport-183608.PayabilitySheets.marketplace_supplier\` ms
+        USING (mp_sup_key)
+      JOIN \`bigqueryexport-183608.PayabilitySheets.v_supplier_summary\` ss
+        USING (supplier_key)
+      WHERE ss.payability_status = 'Active'
+        AND ss.sales_channel = 'Amazon.com'
+        AND (
+          @use_supplier_filter = FALSE
+          OR ss.supplier_key IN (SELECT supplier_key FROM target_suppliers)
+        )
+      GROUP BY ss.supplier_key, order_day
+    ),
+
+    amazon_order_history AS (
+      SELECT
+        supplier_key,
+        order_day,
+        amazon_orders_purchased,
+        amazon_total_orders_price,
+
+        ROW_NUMBER() OVER (
+          PARTITION BY supplier_key
+          ORDER BY order_day DESC
+        ) AS order_rn_desc,
+
+        LAG(amazon_orders_purchased) OVER (
+          PARTITION BY supplier_key
+          ORDER BY order_day
+        ) AS prev_amazon_orders_purchased,
+
+        LAG(amazon_total_orders_price) OVER (
+          PARTITION BY supplier_key
+          ORDER BY order_day
+        ) AS prev_amazon_total_orders_price
+      FROM amazon_orders
+    ),
+
+    latest_amazon_order_row AS (
+      SELECT
+        supplier_key,
+        order_day AS latest_amazon_order_date,
+        amazon_orders_purchased AS latest_amazon_orders_purchased,
+        amazon_total_orders_price AS latest_amazon_total_orders_price,
+        prev_amazon_orders_purchased,
+        prev_amazon_total_orders_price
+      FROM amazon_order_history
+      WHERE order_rn_desc = 1
+    ),
+
+    trailing_amazon_order_medians AS (
+      SELECT
+        supplier_key,
+        APPROX_QUANTILES(amazon_orders_purchased, 100)[OFFSET(50)] AS trailing_median_amazon_orders_purchased,
+        APPROX_QUANTILES(amazon_total_orders_price, 100)[OFFSET(50)] AS trailing_median_amazon_total_orders_price
+      FROM amazon_order_history
+      WHERE order_rn_desc BETWEEN 2 AND 7
+      GROUP BY supplier_key
+    ),
+
+    amazon_order_recent AS (
+      SELECT
+        supplier_key,
+        order_rn_desc,
+        amazon_total_orders_price
+      FROM amazon_order_history
+      WHERE order_rn_desc <= 3
+    ),
+
+    amazon_order_trend_raw AS (
+      SELECT
+        supplier_key,
+        MAX(CASE WHEN order_rn_desc = 1 THEN amazon_total_orders_price END) AS order_value_r1,
+        MAX(CASE WHEN order_rn_desc = 2 THEN amazon_total_orders_price END) AS order_value_r2,
+        MAX(CASE WHEN order_rn_desc = 3 THEN amazon_total_orders_price END) AS order_value_r3
+      FROM amazon_order_recent
+      GROUP BY supplier_key
+    ),
+
+    amazon_order_trend AS (
+      SELECT
+        supplier_key,
+        CASE
+          WHEN order_value_r1 IS NOT NULL
+            AND order_value_r2 IS NOT NULL
+            AND order_value_r3 IS NOT NULL
+            AND order_value_r1 < order_value_r2
+            AND order_value_r2 < order_value_r3
+          THEN 3
+          WHEN order_value_r1 IS NOT NULL
+            AND order_value_r2 IS NOT NULL
+            AND order_value_r1 < order_value_r2
+          THEN 2
+          ELSE 0
+        END AS amazon_order_value_down_streak_3
+      FROM amazon_order_trend_raw
     )
 
     SELECT
       l.supplier_key,
       l.supplier_name,
+      l.sales_channel,
 
       l.receivable AS today_receivable,
       l.prev_receivable,
@@ -315,7 +425,17 @@ export async function getSupplierRiskInputData(
       ta.last_transaction_date,
       DATE_DIFF(CURRENT_DATE(), ta.last_transaction_date, DAY) AS days_since_latest_transaction,
 
-      rt.receivable_down_streak_3
+      rt.receivable_down_streak_3,
+
+      lao.latest_amazon_order_date,
+      DATE_DIFF(CURRENT_DATE(), lao.latest_amazon_order_date, DAY) AS days_since_latest_amazon_order,
+      lao.latest_amazon_orders_purchased,
+      lao.prev_amazon_orders_purchased,
+      lao.latest_amazon_total_orders_price,
+      lao.prev_amazon_total_orders_price,
+      taom.trailing_median_amazon_orders_purchased,
+      taom.trailing_median_amazon_total_orders_price,
+      aot.amazon_order_value_down_streak_3
 
     FROM latest_row l
     LEFT JOIN trailing_medians tm
@@ -334,6 +454,12 @@ export async function getSupplierRiskInputData(
       ON l.supplier_key = ta.supplier_key
     LEFT JOIN receivable_trend rt
       ON l.supplier_key = rt.supplier_key
+    LEFT JOIN latest_amazon_order_row lao
+      ON l.supplier_key = lao.supplier_key
+    LEFT JOIN trailing_amazon_order_medians taom
+      ON l.supplier_key = taom.supplier_key
+    LEFT JOIN amazon_order_trend aot
+      ON l.supplier_key = aot.supplier_key
 
     ORDER BY l.outstanding_bal DESC
     LIMIT @limit
@@ -354,10 +480,6 @@ export async function getSupplierRiskInputData(
   return rows;
 }
 
-/**
- * Compatibility shim for legacy callers.
- * If no supplierKeys provided, fetches all active suppliers' latest state.
- */
 export async function getDailyChangeData() {
   return getSupplierRiskInputData();
 }
