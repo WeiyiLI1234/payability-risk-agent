@@ -1,4 +1,4 @@
-export const RISK_POLICY_VERSION = "v4.2.0";
+export const RISK_POLICY_VERSION = "v4.3.0";
 
 export const RISK_THRESHOLDS = {
   receivableSurge: {
@@ -24,6 +24,25 @@ export const RISK_THRESHOLDS = {
 
     minPrevReceivable: 5_000,
     minTrailingMedianReceivable: 3_000,
+
+    sustainedDownStreakMedium: 2,
+    sustainedDownStreakHigh: 3,
+  },
+
+  amazonOrderActivityDrop: {
+    maxDaysSinceLatestOrderData: 14,
+
+    wowMediumDropPct: 50,
+    wowHighDropPct: 70,
+
+    histMediumMaxRatio: 0.80,
+    histHighMaxRatio: 0.60,
+
+    minPrevOrderCount: 3,
+    minPrevOrderValue: 500,
+
+    minTrailingMedianOrderCount: 3,
+    minTrailingMedianOrderValue: 500,
 
     sustainedDownStreakMedium: 2,
     sustainedDownStreakHigh: 3,
@@ -83,6 +102,7 @@ export const RISK_THRESHOLDS = {
 export const RISK_WEIGHTS = {
   receivableSurge: 8,
   receivableDrop: 10,
+  amazonOrderActivityDrop: 7,
   marketplacePaymentDelay: 12,
   chargebackAnomaly: 18,
   negativeNetEarning: 15,
