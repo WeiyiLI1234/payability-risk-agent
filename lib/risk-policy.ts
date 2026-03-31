@@ -1,4 +1,4 @@
-export const RISK_POLICY_VERSION = "v4.3.0";
+export const RISK_POLICY_VERSION = "v4.3.2";
 
 export const RISK_THRESHOLDS = {
   receivableSurge: {
@@ -10,7 +10,6 @@ export const RISK_THRESHOLDS = {
     histHigh: 4.0,
     histCritical: 8.0,
 
-    // Absolute gates
     minTodayReceivableMedium: 3_000,
     minTodayReceivableHighCrit: 5_000,
     minDeltaReceivable: 2_000,
@@ -20,9 +19,6 @@ export const RISK_THRESHOLDS = {
     wowMediumDropPct: 50,
     wowHighDropPct: 70,
 
-    histMediumMaxRatio: 0.60,
-    histHighMaxRatio: 0.40,
-
     minPrevReceivable: 5_000,
     minTrailingMedianReceivable: 3_000,
 
@@ -31,14 +27,10 @@ export const RISK_THRESHOLDS = {
   },
 
   amazonOrderActivityDrop: {
-    // Only assess when recent Amazon order data is available and not stale
     maxDaysSinceLatestOrderData: 14,
 
     wowMediumDropPct: 50,
     wowHighDropPct: 70,
-
-    histMediumMaxRatio: 0.80,
-    histHighMaxRatio: 0.60,
 
     minPrevOrderCount: 3,
     minPrevOrderValue: 500,
@@ -71,7 +63,6 @@ export const RISK_THRESHOLDS = {
     histHigh: 4.5,
     histCritical: 10.0,
 
-    // At least one must be true
     minChargebackAmountMedium: 200,
     minChargebackAmountHigh: 500,
     minChargebackDeltaVsMedian: 200,
@@ -90,7 +81,7 @@ export const RISK_THRESHOLDS = {
   },
 
   dueFromSupplierPct: {
-    medium: 0.10,
+    medium: 0.1,
     high: 0.25,
   },
 
