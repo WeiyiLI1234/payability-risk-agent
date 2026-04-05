@@ -27,14 +27,21 @@ export const RISK_THRESHOLDS = {
   },
 
   amazonOrderActivityDrop: {
-    maxDaysSinceLatestOrderData: 14,
+    // Gate 2: data quality — skip if order data is too sparse across transaction history
+    dataQualityMinTotalTransactionRows: 20,  // only apply gate if supplier has meaningful history
+    dataQualityMaxOrderDensity: 0.10,         // skip if <10% of transaction rows have order data
 
+    // Gate 3: recency routing
+    activeWindowDays: 30,          // ≤ 30d → eligible for period-over-period drop detection
+    stopSellingMaxDays: 90,        // 31–90d + density ≥ threshold → recent stop-selling signal
+    stopSellingMinDensity: 0.30,   // require ≥ 30% historical density to qualify as stop-selling
+
+    // Drop detection thresholds (Gate 3a: ≤ activeWindowDays)
     wowMediumDropPct: 50,
     wowHighDropPct: 70,
 
     minPrevOrderCount: 3,
     minPrevOrderValue: 500,
-
     minTrailingMedianOrderCount: 3,
     minTrailingMedianOrderValue: 500,
 

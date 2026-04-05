@@ -45,6 +45,10 @@ export type DailyChangeRow = {
 
   receivable_down_streak_3?: number | null;
 
+  // Amazon order density gate fields (new in v4.3.2)
+  total_transaction_rows?: number | null;
+  total_amazon_order_rows?: number | null;
+
   latest_amazon_order_date?: string | null;
   days_since_latest_amazon_order?: number | null;
   latest_amazon_orders_purchased?: number | null;
@@ -142,7 +146,6 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
 
     const todayReceivable = safeNum(r.today_receivable);
     const prevReceivable = r.prev_receivable === null ? null : safeNum(r.prev_receivable);
-
     const todayLiability = safeNum(r.today_liability);
     const todayChargeback = safeNum(r.today_chargeback);
     const computedNetEarning =
@@ -152,7 +155,6 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
 
     const todayAvail = safeNum(r.today_available_balance);
     const outstandingBal = safeNum(r.today_outstanding_bal);
-
     const receivablePct =
       r.receivable_change_pct === null ? null : safeNum(r.receivable_change_pct);
 
@@ -187,6 +189,12 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
     const receivableDownStreak3 =
       r.receivable_down_streak_3 == null ? 0 : safeNum(r.receivable_down_streak_3);
 
+    // Amazon order fields
+    const totalTransactionRows =
+      r.total_transaction_rows == null ? 0 : safeNum(r.total_transaction_rows);
+    const totalAmazonOrderRows =
+      r.total_amazon_order_rows == null ? 0 : safeNum(r.total_amazon_order_rows);
+
     const latestAmazonOrdersPurchased =
       r.latest_amazon_orders_purchased == null ? null : safeNum(r.latest_amazon_orders_purchased);
     const prevAmazonOrdersPurchased =
@@ -220,6 +228,33 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
     const dueFromSupplierTurnedPositive = todayDueFromSupplier > 0 && prevDueFromSupplier <= 0;
     const chargebackRatio = safeRatio(todayChargeback, todayReceivable);
 
+    const amazonOrderCountChangePct =
+      latestAmazonOrdersPurchased === null ||
+      prevAmazonOrdersPurchased === null ||
+      prevAmazonOrdersPurchased === 0
+        ? null
+        : ((latestAmazonOrdersPurchased - prevAmazonOrdersPurchased) /
+            Math.abs(prevAmazonOrdersPurchased)) *
+          100;
+
+    const amazonOrderValueChangePct =
+      latestAmazonTotalOrdersPrice === null ||
+      prevAmazonTotalOrdersPrice === null ||
+      prevAmazonTotalOrdersPrice === 0
+        ? null
+        : ((latestAmazonTotalOrdersPrice - prevAmazonTotalOrdersPrice) /
+            Math.abs(prevAmazonTotalOrdersPrice)) *
+          100;
+
+    const amazonOrderCountVsHistoryRatio = safeRatio(
+      latestAmazonOrdersPurchased ?? 0,
+      trailingMedianAmazonOrdersPurchased ?? 0
+    );
+    const amazonOrderValueVsHistoryRatio = safeRatio(
+      latestAmazonTotalOrdersPrice ?? 0,
+      trailingMedianAmazonTotalOrdersPrice ?? 0
+    );
+
     const hasRecentTransactionActivity =
       transactionRecordsLast21d >=
         RISK_THRESHOLDS.paymentDelayEligibility.minRecentTransactionCount &&
@@ -227,7 +262,9 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
       daysSinceLatestTransaction <=
         RISK_THRESHOLDS.paymentDelayEligibility.maxDaysSinceLatestTransaction;
 
-    // RECEIVABLE_SURGE
+    // =========================================================================
+    // 1) RECEIVABLE_SURGE
+    // =========================================================================
     const receivableDeltaAbsolute = todayReceivable - (prevReceivable ?? 0);
 
     const receivableAbsGateMedium =
@@ -253,9 +290,7 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
       receivableSurgeSeverity = "CRITICAL";
       receivableSurgeScore = Math.round(RISK_WEIGHTS.receivableSurge * 0.9);
       reasons.push(
-        `Receivable surge is severe: latest receivables rose ${fmtPct(
-          receivablePct
-        )} and now stand at ${receivableVsHistoryRatio.toFixed(2)}x trailing median.`
+        `Receivable surge is severe: latest receivables rose ${fmtPct(receivablePct)} and now stand at ${receivableVsHistoryRatio.toFixed(2)}x trailing median.`
       );
     } else if (
       receivablePct !== null &&
@@ -268,9 +303,7 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
       receivableSurgeSeverity = "HIGH";
       receivableSurgeScore = Math.round(RISK_WEIGHTS.receivableSurge * 0.7);
       reasons.push(
-        `Receivable surge is material: latest receivables rose ${fmtPct(
-          receivablePct
-        )} and now stand at ${receivableVsHistoryRatio.toFixed(2)}x trailing median.`
+        `Receivable surge is material: latest receivables rose ${fmtPct(receivablePct)} and now stand at ${receivableVsHistoryRatio.toFixed(2)}x trailing median.`
       );
     } else if (
       receivablePct !== null &&
@@ -283,9 +316,7 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
       receivableSurgeSeverity = "MEDIUM";
       receivableSurgeScore = Math.round(RISK_WEIGHTS.receivableSurge * 0.45);
       reasons.push(
-        `Receivables increased ${fmtPct(
-          receivablePct
-        )} and are now ${receivableVsHistoryRatio.toFixed(2)}x trailing median.`
+        `Receivables increased ${fmtPct(receivablePct)} and are now ${receivableVsHistoryRatio.toFixed(2)}x trailing median.`
       );
     }
 
@@ -299,15 +330,15 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
           ? "Receivable surge cannot be assessed because prior record is unavailable."
           : receivableVsHistoryRatio === null
           ? `Receivables changed by ${fmtPct(receivablePct)}, but historical baseline is unavailable.`
-          : `Receivables changed by ${fmtPct(
-              receivablePct
-            )} and current level is ${receivableVsHistoryRatio.toFixed(2)}x trailing median.`,
+          : `Receivables changed by ${fmtPct(receivablePct)} and current level is ${receivableVsHistoryRatio.toFixed(2)}x trailing median.`,
       severity: receivableSurgeSeverity,
       score_contribution: receivableSurgeScore,
       triggered: receivable_surge_flagged,
     });
 
-    // RECEIVABLE_DROP
+    // =========================================================================
+    // 2) RECEIVABLE_DROP
+    // =========================================================================
     const dropPctEligible =
       prevReceivable !== null &&
       prevReceivable >= RISK_THRESHOLDS.receivableDrop.minPrevReceivable &&
@@ -320,18 +351,18 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
 
     const sharpDropHigh =
       dropPctEligible &&
-      receivablePct <= -RISK_THRESHOLDS.receivableDrop.wowHighDropPct &&
+      receivablePct! <= -RISK_THRESHOLDS.receivableDrop.wowHighDropPct &&
       dropHistEligible &&
-      receivableVsHistoryRatio <= 0.6;
+      receivableVsHistoryRatio! <= 0.6;
 
     const sharpDropMedium =
       dropPctEligible &&
-      receivablePct <= -RISK_THRESHOLDS.receivableDrop.wowMediumDropPct;
+      receivablePct! <= -RISK_THRESHOLDS.receivableDrop.wowMediumDropPct;
 
     const sustainedDropHigh =
       receivableDownStreak3 >= RISK_THRESHOLDS.receivableDrop.sustainedDownStreakHigh &&
       dropHistEligible &&
-      receivableVsHistoryRatio <= 0.8;
+      receivableVsHistoryRatio! <= 0.8;
 
     const sustainedDropMedium =
       receivableDownStreak3 >= RISK_THRESHOLDS.receivableDrop.sustainedDownStreakMedium &&
@@ -347,22 +378,14 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
       receivableDropSeverity = "HIGH";
       receivableDropScore = RISK_WEIGHTS.receivableDrop;
       reasons.push(
-        `Receivables show material deterioration: latest change is ${
-          receivablePct === null ? "N/A" : fmtPct(receivablePct)
-        }, current level is ${
-          receivableVsHistoryRatio === null
-            ? "N/A"
-            : `${receivableVsHistoryRatio.toFixed(2)}x trailing median`
-        }, and recent down-streak count is ${receivableDownStreak3}.`
+        `Receivables show material deterioration: latest change is ${receivablePct === null ? "N/A" : fmtPct(receivablePct)}, current level is ${receivableVsHistoryRatio === null ? "N/A" : `${receivableVsHistoryRatio.toFixed(2)}x trailing median`}, and recent down-streak count is ${receivableDownStreak3}.`
       );
     } else if (sharpDropMedium || sustainedDropMedium) {
       receivable_drop_flagged = true;
       receivableDropSeverity = "MEDIUM";
       receivableDropScore = Math.round(RISK_WEIGHTS.receivableDrop * 0.6);
       reasons.push(
-        `Receivables show deterioration: latest change is ${
-          receivablePct === null ? "N/A" : fmtPct(receivablePct)
-        }, and recent down-streak count is ${receivableDownStreak3}.`
+        `Receivables show deterioration: latest change is ${receivablePct === null ? "N/A" : fmtPct(receivablePct)}, and recent down-streak count is ${receivableDownStreak3}.`
       );
     }
 
@@ -374,52 +397,68 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
       explanation:
         receivablePct === null && receivableVsHistoryRatio === null
           ? "Receivable drop cannot be fully assessed because prior and historical baselines are unavailable."
-          : `Receivables changed by ${
-              receivablePct === null ? "N/A" : fmtPct(receivablePct)
-            }; current level is ${
-              receivableVsHistoryRatio === null
-                ? "N/A"
-                : `${receivableVsHistoryRatio.toFixed(2)}x trailing median`
-            }, and the recent down-streak count is ${receivableDownStreak3}.`,
+          : `Receivables changed by ${receivablePct === null ? "N/A" : fmtPct(receivablePct)}; current level is ${receivableVsHistoryRatio === null ? "N/A" : `${receivableVsHistoryRatio.toFixed(2)}x trailing median`}, and the recent down-streak count is ${receivableDownStreak3}.`,
       severity: receivableDropSeverity,
       score_contribution: receivableDropScore,
       triggered: receivable_drop_flagged,
     });
 
-    // ORDER_ACTIVITY_DROP
-    const amazonOrderCountChangePct =
-      latestAmazonOrdersPurchased === null ||
-      prevAmazonOrdersPurchased === null ||
-      prevAmazonOrdersPurchased === 0
-        ? null
-        : ((latestAmazonOrdersPurchased - prevAmazonOrdersPurchased) /
-            Math.abs(prevAmazonOrdersPurchased)) *
-          100;
+    // =========================================================================
+    // 3) ORDER_ACTIVITY_DROP — three-gate design
+    //
+    // Gate 1: Never had Amazon orders → not an Amazon seller → SKIP
+    // Gate 2: Data quality — too sparse to be reliable → SKIP
+    // Gate 3a: Recent data (≤ 30d) → normal period-over-period drop detection
+    // Gate 3b: Recently stopped selling (31–90d, density ≥ 30%) → MEDIUM signal
+    // Gate 3c: Stopped selling > 90d ago → SKIP (financial risk covered elsewhere)
+    // =========================================================================
+    const orderDensity =
+      totalTransactionRows > 0 ? totalAmazonOrderRows / totalTransactionRows : 0;
 
-    const amazonOrderValueChangePct =
-      latestAmazonTotalOrdersPrice === null ||
-      prevAmazonTotalOrdersPrice === null ||
-      prevAmazonTotalOrdersPrice === 0
-        ? null
-        : ((latestAmazonTotalOrdersPrice - prevAmazonTotalOrdersPrice) /
-            Math.abs(prevAmazonTotalOrdersPrice)) *
-          100;
+    // Gate 1: Never had Amazon orders
+    const hasEverHadAmazonOrders =
+      totalAmazonOrderRows > 0 ||
+      latestAmazonOrdersPurchased !== null ||
+      trailingMedianAmazonOrdersPurchased !== null;
 
-    const amazonOrderCountVsHistoryRatio = safeRatio(
-      latestAmazonOrdersPurchased ?? 0,
-      trailingMedianAmazonOrdersPurchased ?? 0
-    );
+    // Gate 2: Data quality check
+    const isDataQualityIssue =
+      totalTransactionRows >
+        RISK_THRESHOLDS.amazonOrderActivityDrop.dataQualityMinTotalTransactionRows &&
+      orderDensity < RISK_THRESHOLDS.amazonOrderActivityDrop.dataQualityMaxOrderDensity;
 
-    const amazonOrderValueVsHistoryRatio = safeRatio(
-      latestAmazonTotalOrdersPrice ?? 0,
-      trailingMedianAmazonTotalOrdersPrice ?? 0
-    );
-
-    const hasReliableAmazonOrderData =
+    // Gate 3 routing
+    const isRecentlyActive =
       daysSinceLatestAmazonOrder !== null &&
-      daysSinceLatestAmazonOrder <=
-        RISK_THRESHOLDS.amazonOrderActivityDrop.maxDaysSinceLatestOrderData &&
-      (
+      daysSinceLatestAmazonOrder <= RISK_THRESHOLDS.amazonOrderActivityDrop.activeWindowDays;
+
+    const isRecentlyStoppedSelling =
+      !isRecentlyActive &&
+      daysSinceLatestAmazonOrder !== null &&
+      daysSinceLatestAmazonOrder <= RISK_THRESHOLDS.amazonOrderActivityDrop.stopSellingMaxDays &&
+      orderDensity >= RISK_THRESHOLDS.amazonOrderActivityDrop.stopSellingMinDensity;
+
+    let order_activity_drop_flagged = false;
+    let orderActivitySeverity: MetricResult["severity"] = "NONE";
+    let orderActivityScore = 0;
+    let orderActivityExplanation = "";
+    let orderActivityValue: number | null = null;
+    let orderActivityUnit = "%";
+    let hasReliableAmazonOrderData = false;
+
+    if (!hasEverHadAmazonOrders) {
+      // Gate 1 — not an Amazon seller
+      orderActivityExplanation =
+        "Amazon order activity check skipped — this supplier has no Amazon order history and is likely not an Amazon seller.";
+    } else if (isDataQualityIssue) {
+      // Gate 2 — data too sparse
+      orderActivityExplanation =
+        `Amazon order activity check skipped — order data density is too low to be reliable ` +
+        `(${totalAmazonOrderRows} order day(s) across ${totalTransactionRows} transaction records, ` +
+        `${(orderDensity * 100).toFixed(1)}% density).`;
+    } else if (isRecentlyActive) {
+      // Gate 3a — normal drop detection
+      const hasBaselineData =
         (prevAmazonOrdersPurchased !== null &&
           prevAmazonOrdersPurchased >=
             RISK_THRESHOLDS.amazonOrderActivityDrop.minPrevOrderCount) ||
@@ -431,123 +470,120 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
             RISK_THRESHOLDS.amazonOrderActivityDrop.minTrailingMedianOrderCount) ||
         (trailingMedianAmazonTotalOrdersPrice !== null &&
           trailingMedianAmazonTotalOrdersPrice >=
-            RISK_THRESHOLDS.amazonOrderActivityDrop.minTrailingMedianOrderValue)
-      );
+            RISK_THRESHOLDS.amazonOrderActivityDrop.minTrailingMedianOrderValue);
 
-    const orderDropHigh =
-      hasReliableAmazonOrderData &&
-      (
-        (
-          amazonOrderCountChangePct !== null &&
-          amazonOrderCountChangePct <=
-            -RISK_THRESHOLDS.amazonOrderActivityDrop.wowHighDropPct &&
-          amazonOrderCountVsHistoryRatio !== null &&
-          amazonOrderCountVsHistoryRatio <= 0.6
-        ) ||
-        (
-          amazonOrderValueChangePct !== null &&
-          amazonOrderValueChangePct <=
-            -RISK_THRESHOLDS.amazonOrderActivityDrop.wowHighDropPct &&
-          amazonOrderValueVsHistoryRatio !== null &&
-          amazonOrderValueVsHistoryRatio <= 0.6
-        ) ||
-        (
-          amazonOrderValueDownStreak3 >=
+      if (!hasBaselineData) {
+        orderActivityExplanation =
+          "Amazon order activity drop check skipped — insufficient order history for reliable period-over-period assessment.";
+      } else {
+        hasReliableAmazonOrderData = true;
+        orderActivityValue =
+          amazonOrderValueChangePct !== null ? amazonOrderValueChangePct : amazonOrderCountChangePct;
+
+        const orderDropHigh =
+          (amazonOrderCountChangePct !== null &&
+            amazonOrderCountChangePct <=
+              -RISK_THRESHOLDS.amazonOrderActivityDrop.wowHighDropPct &&
+            amazonOrderCountVsHistoryRatio !== null &&
+            amazonOrderCountVsHistoryRatio <= 0.6) ||
+          (amazonOrderValueChangePct !== null &&
+            amazonOrderValueChangePct <=
+              -RISK_THRESHOLDS.amazonOrderActivityDrop.wowHighDropPct &&
+            amazonOrderValueVsHistoryRatio !== null &&
+            amazonOrderValueVsHistoryRatio <= 0.6) ||
+          (amazonOrderValueDownStreak3 >=
             RISK_THRESHOLDS.amazonOrderActivityDrop.sustainedDownStreakHigh &&
-          (
-            (amazonOrderValueVsHistoryRatio !== null &&
+            ((amazonOrderValueVsHistoryRatio !== null &&
               amazonOrderValueVsHistoryRatio <= 0.8) ||
-            (amazonOrderCountVsHistoryRatio !== null &&
-              amazonOrderCountVsHistoryRatio <= 0.8)
-          )
-        )
-      );
+              (amazonOrderCountVsHistoryRatio !== null &&
+                amazonOrderCountVsHistoryRatio <= 0.8)));
 
-    const orderDropMedium =
-      hasReliableAmazonOrderData &&
-      !orderDropHigh &&
-      (
-        (
-          amazonOrderCountChangePct !== null &&
-          amazonOrderCountChangePct <=
-            -RISK_THRESHOLDS.amazonOrderActivityDrop.wowMediumDropPct
-        ) ||
-        (
-          amazonOrderValueChangePct !== null &&
-          amazonOrderValueChangePct <=
-            -RISK_THRESHOLDS.amazonOrderActivityDrop.wowMediumDropPct
-        ) ||
-        amazonOrderValueDownStreak3 >=
-          RISK_THRESHOLDS.amazonOrderActivityDrop.sustainedDownStreakMedium
-      );
+        const orderDropMedium =
+          !orderDropHigh &&
+          ((amazonOrderCountChangePct !== null &&
+            amazonOrderCountChangePct <=
+              -RISK_THRESHOLDS.amazonOrderActivityDrop.wowMediumDropPct) ||
+            (amazonOrderValueChangePct !== null &&
+              amazonOrderValueChangePct <=
+                -RISK_THRESHOLDS.amazonOrderActivityDrop.wowMediumDropPct) ||
+            amazonOrderValueDownStreak3 >=
+              RISK_THRESHOLDS.amazonOrderActivityDrop.sustainedDownStreakMedium);
 
-    let order_activity_drop_flagged = false;
-    let orderActivitySeverity: MetricResult["severity"] = "NONE";
-    let orderActivityScore = 0;
-    let orderActivityExplanation = "";
-
-    if (!hasReliableAmazonOrderData) {
-      orderActivityExplanation =
-        "Amazon order activity drop check skipped — Amazon order data is missing, stale, or insufficient for reliable assessment.";
-    } else if (orderDropHigh) {
-      order_activity_drop_flagged = true;
-      orderActivitySeverity = "HIGH";
-      orderActivityScore = RISK_WEIGHTS.amazonOrderActivityDrop;
-      reasons.push(
-        "Amazon order activity shows material deterioration: latest order-day activity is down sharply or has been declining consistently relative to recent order history."
-      );
-      orderActivityExplanation = `Latest Amazon order activity shows deterioration. Latest order count is ${
-        latestAmazonOrdersPurchased === null ? "N/A" : latestAmazonOrdersPurchased
-      }, latest order GMV is ${
-        latestAmazonTotalOrdersPrice === null ? "N/A" : fmtMoney(latestAmazonTotalOrdersPrice)
-      }, latest order-count change is ${
-        amazonOrderCountChangePct === null ? "N/A" : fmtPct(amazonOrderCountChangePct)
-      }, latest order-value change is ${
-        amazonOrderValueChangePct === null ? "N/A" : fmtPct(amazonOrderValueChangePct)
-      }, and the recent Amazon order-value down-streak count is ${amazonOrderValueDownStreak3}.`;
-    } else if (orderDropMedium) {
+        if (orderDropHigh) {
+          order_activity_drop_flagged = true;
+          orderActivitySeverity = "HIGH";
+          orderActivityScore = RISK_WEIGHTS.amazonOrderActivityDrop;
+          reasons.push(
+            "Amazon order activity shows material deterioration: latest order-day activity is down sharply or has been declining consistently relative to recent order history."
+          );
+          orderActivityExplanation =
+            `Latest Amazon order activity shows deterioration. ` +
+            `Order count: ${latestAmazonOrdersPurchased === null ? "N/A" : latestAmazonOrdersPurchased}, ` +
+            `order GMV: ${latestAmazonTotalOrdersPrice === null ? "N/A" : fmtMoney(latestAmazonTotalOrdersPrice)}, ` +
+            `order-count change: ${amazonOrderCountChangePct === null ? "N/A" : fmtPct(amazonOrderCountChangePct)}, ` +
+            `order-value change: ${amazonOrderValueChangePct === null ? "N/A" : fmtPct(amazonOrderValueChangePct)}, ` +
+            `down-streak: ${amazonOrderValueDownStreak3}.`;
+        } else if (orderDropMedium) {
+          order_activity_drop_flagged = true;
+          orderActivitySeverity = "MEDIUM";
+          orderActivityScore = Math.round(RISK_WEIGHTS.amazonOrderActivityDrop * 0.6);
+          reasons.push(
+            "Amazon order activity shows weakening: latest order-day activity has declined relative to recent order history."
+          );
+          orderActivityExplanation =
+            `Latest Amazon order activity shows weakening. ` +
+            `Order count: ${latestAmazonOrdersPurchased === null ? "N/A" : latestAmazonOrdersPurchased}, ` +
+            `order GMV: ${latestAmazonTotalOrdersPrice === null ? "N/A" : fmtMoney(latestAmazonTotalOrdersPrice)}, ` +
+            `order-count change: ${amazonOrderCountChangePct === null ? "N/A" : fmtPct(amazonOrderCountChangePct)}, ` +
+            `order-value change: ${amazonOrderValueChangePct === null ? "N/A" : fmtPct(amazonOrderValueChangePct)}, ` +
+            `down-streak: ${amazonOrderValueDownStreak3}.`;
+        } else {
+          orderActivityExplanation =
+            `Amazon order activity does not show a material drop. ` +
+            `Order count: ${latestAmazonOrdersPurchased === null ? "N/A" : latestAmazonOrdersPurchased}, ` +
+            `order GMV: ${latestAmazonTotalOrdersPrice === null ? "N/A" : fmtMoney(latestAmazonTotalOrdersPrice)}, ` +
+            `order-count change: ${amazonOrderCountChangePct === null ? "N/A" : fmtPct(amazonOrderCountChangePct)}, ` +
+            `order-value change: ${amazonOrderValueChangePct === null ? "N/A" : fmtPct(amazonOrderValueChangePct)}, ` +
+            `down-streak: ${amazonOrderValueDownStreak3}.`;
+        }
+      }
+    } else if (isRecentlyStoppedSelling) {
+      // Gate 3b — recently stopped selling
       order_activity_drop_flagged = true;
       orderActivitySeverity = "MEDIUM";
       orderActivityScore = Math.round(RISK_WEIGHTS.amazonOrderActivityDrop * 0.6);
+      orderActivityValue = daysSinceLatestAmazonOrder;
+      orderActivityUnit = "days";
       reasons.push(
-        "Amazon order activity shows weakening: latest order-day activity has declined relative to recent order history."
+        `Amazon order activity has gone silent: no orders recorded in ${daysSinceLatestAmazonOrder} days despite previously consistent activity ` +
+        `(historical order density: ${(orderDensity * 100).toFixed(0)}%).`
       );
-      orderActivityExplanation = `Latest Amazon order activity shows weakening. Latest order count is ${
-        latestAmazonOrdersPurchased === null ? "N/A" : latestAmazonOrdersPurchased
-      }, latest order GMV is ${
-        latestAmazonTotalOrdersPrice === null ? "N/A" : fmtMoney(latestAmazonTotalOrdersPrice)
-      }, latest order-count change is ${
-        amazonOrderCountChangePct === null ? "N/A" : fmtPct(amazonOrderCountChangePct)
-      }, latest order-value change is ${
-        amazonOrderValueChangePct === null ? "N/A" : fmtPct(amazonOrderValueChangePct)
-      }, and the recent Amazon order-value down-streak count is ${amazonOrderValueDownStreak3}.`;
+      orderActivityExplanation =
+        `Latest Amazon order was ${daysSinceLatestAmazonOrder} days ago. ` +
+        `Historical order density of ${(orderDensity * 100).toFixed(0)}% across ${totalTransactionRows} ` +
+        `transaction records indicates this is a genuine stop-selling signal rather than a data gap.`;
     } else {
-      orderActivityExplanation = `Amazon order activity is available and does not currently show a material drop. Latest order count is ${
-        latestAmazonOrdersPurchased === null ? "N/A" : latestAmazonOrdersPurchased
-      }, latest order GMV is ${
-        latestAmazonTotalOrdersPrice === null ? "N/A" : fmtMoney(latestAmazonTotalOrdersPrice)
-      }, latest order-count change is ${
-        amazonOrderCountChangePct === null ? "N/A" : fmtPct(amazonOrderCountChangePct)
-      }, latest order-value change is ${
-        amazonOrderValueChangePct === null ? "N/A" : fmtPct(amazonOrderValueChangePct)
-      }, and the recent Amazon order-value down-streak count is ${amazonOrderValueDownStreak3}.`;
+      // Gate 3c — stopped selling > 90d ago; financial risk covered by other metrics
+      orderActivityExplanation =
+        daysSinceLatestAmazonOrder !== null
+          ? `Amazon order activity check skipped — latest order was ${daysSinceLatestAmazonOrder} days ago. Any outstanding financial risk is assessed by other metrics.`
+          : "Amazon order activity check skipped — no Amazon order date available.";
     }
 
     engineScore += orderActivityScore;
     metrics.push({
       metric_id: "ORDER_ACTIVITY_DROP",
-      value:
-        amazonOrderValueChangePct !== null
-          ? amazonOrderValueChangePct
-          : amazonOrderCountChangePct,
-      unit: "%",
+      value: orderActivityValue,
+      unit: orderActivityUnit,
       explanation: orderActivityExplanation,
       severity: orderActivitySeverity,
       score_contribution: orderActivityScore,
       triggered: order_activity_drop_flagged,
     });
 
-    // MARKETPLACE_PAYMENT_DELAY
+    // =========================================================================
+    // 4) MARKETPLACE_PAYMENT_DELAY — activation-aware
+    // =========================================================================
     let marketplace_payment_delay_flagged = false;
     let paymentDelaySeverity: MetricResult["severity"] = "NONE";
     let paymentDelayScore = 0;
@@ -573,18 +609,14 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
           reasons.push(
             `Marketplace payment appears severely delayed: supplier has been active for ${daysSinceLastActivation} days since the latest activation date, shows recent transaction activity, and still has no marketplace payment in the current activation cycle.`
           );
-        } else if (
-          daysSinceLastActivation > RISK_THRESHOLDS.marketplacePaymentDelayDays.high
-        ) {
+        } else if (daysSinceLastActivation > RISK_THRESHOLDS.marketplacePaymentDelayDays.high) {
           marketplace_payment_delay_flagged = true;
           paymentDelaySeverity = "HIGH";
           paymentDelayScore = Math.round(RISK_WEIGHTS.marketplacePaymentDelay * 0.7);
           reasons.push(
             `Marketplace payment delay is elevated: supplier has been active for ${daysSinceLastActivation} days since the latest activation date, shows recent transaction activity, and still has no marketplace payment in the current activation cycle.`
           );
-        } else if (
-          daysSinceLastActivation > RISK_THRESHOLDS.marketplacePaymentDelayDays.medium
-        ) {
+        } else if (daysSinceLastActivation > RISK_THRESHOLDS.marketplacePaymentDelayDays.medium) {
           marketplace_payment_delay_flagged = true;
           paymentDelaySeverity = "MEDIUM";
           paymentDelayScore = Math.round(RISK_WEIGHTS.marketplacePaymentDelay * 0.45);
@@ -602,30 +634,21 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
       paymentDelayValue = daysSinceLastMarketplacePayment;
       paymentDelayBasis = "PAYMENT";
 
-      if (
-        daysSinceLastMarketplacePayment >
-        RISK_THRESHOLDS.marketplacePaymentDelayDays.critical
-      ) {
+      if (daysSinceLastMarketplacePayment > RISK_THRESHOLDS.marketplacePaymentDelayDays.critical) {
         marketplace_payment_delay_flagged = true;
         paymentDelaySeverity = "CRITICAL";
         paymentDelayScore = RISK_WEIGHTS.marketplacePaymentDelay;
         reasons.push(
           `Marketplace payment appears severely delayed at ${daysSinceLastMarketplacePayment} days since the last positive payment in the current activation cycle, despite recent transaction activity.`
         );
-      } else if (
-        daysSinceLastMarketplacePayment >
-        RISK_THRESHOLDS.marketplacePaymentDelayDays.high
-      ) {
+      } else if (daysSinceLastMarketplacePayment > RISK_THRESHOLDS.marketplacePaymentDelayDays.high) {
         marketplace_payment_delay_flagged = true;
         paymentDelaySeverity = "HIGH";
         paymentDelayScore = Math.round(RISK_WEIGHTS.marketplacePaymentDelay * 0.7);
         reasons.push(
           `Marketplace payment delay is elevated at ${daysSinceLastMarketplacePayment} days since the last positive payment in the current activation cycle, despite recent transaction activity.`
         );
-      } else if (
-        daysSinceLastMarketplacePayment >
-        RISK_THRESHOLDS.marketplacePaymentDelayDays.medium
-      ) {
+      } else if (daysSinceLastMarketplacePayment > RISK_THRESHOLDS.marketplacePaymentDelayDays.medium) {
         marketplace_payment_delay_flagged = true;
         paymentDelaySeverity = "MEDIUM";
         paymentDelayScore = Math.round(RISK_WEIGHTS.marketplacePaymentDelay * 0.45);
@@ -653,7 +676,9 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
       triggered: marketplace_payment_delay_flagged,
     });
 
-    // CHARGEBACK_ANOMALY
+    // =========================================================================
+    // 5) CHARGEBACK_ANOMALY
+    // =========================================================================
     const chargebackAbsGateMedium =
       todayChargeback >= RISK_THRESHOLDS.chargebackAnomaly.minChargebackAmountMedium ||
       (chargebackDeltaVsMedian !== null &&
@@ -680,9 +705,7 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
         chargebackSeverity = "CRITICAL";
         chargebackScore = Math.round(RISK_WEIGHTS.chargebackAnomaly * 0.9);
         reasons.push(
-          `Chargeback anomaly is severe: ratio is ${chargebackRatio.toFixed(
-            2
-          )} and chargebacks are ${chargebackVsHistoryRatio.toFixed(2)}x trailing median.`
+          `Chargeback anomaly is severe: ratio is ${chargebackRatio.toFixed(2)} and chargebacks are ${chargebackVsHistoryRatio.toFixed(2)}x trailing median.`
         );
       } else if (
         chargebackRatio !== null &&
@@ -695,9 +718,7 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
         chargebackSeverity = "HIGH";
         chargebackScore = Math.round(RISK_WEIGHTS.chargebackAnomaly * 0.7);
         reasons.push(
-          `Chargeback anomaly is material: ratio is ${chargebackRatio.toFixed(
-            2
-          )} and chargebacks are ${chargebackVsHistoryRatio.toFixed(2)}x trailing median.`
+          `Chargeback anomaly is material: ratio is ${chargebackRatio.toFixed(2)} and chargebacks are ${chargebackVsHistoryRatio.toFixed(2)}x trailing median.`
         );
       } else if (
         chargebackRatio !== null &&
@@ -710,9 +731,7 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
         chargebackSeverity = "MEDIUM";
         chargebackScore = Math.round(RISK_WEIGHTS.chargebackAnomaly * 0.45);
         reasons.push(
-          `Chargebacks are elevated: ratio is ${chargebackRatio.toFixed(
-            2
-          )} and chargebacks are ${chargebackVsHistoryRatio.toFixed(2)}x trailing median.`
+          `Chargebacks are elevated: ratio is ${chargebackRatio.toFixed(2)} and chargebacks are ${chargebackVsHistoryRatio.toFixed(2)}x trailing median.`
         );
       }
     }
@@ -729,15 +748,15 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
           ? "Chargeback anomaly cannot be assessed because chargeback ratio is unavailable."
           : chargebackVsHistoryRatio === null
           ? `Chargeback ratio is ${chargebackRatio.toFixed(2)}, but historical baseline is unavailable.`
-          : `Chargeback ratio is ${chargebackRatio.toFixed(
-              2
-            )} and chargebacks are ${chargebackVsHistoryRatio.toFixed(2)}x trailing median.`,
+          : `Chargeback ratio is ${chargebackRatio.toFixed(2)} and chargebacks are ${chargebackVsHistoryRatio.toFixed(2)}x trailing median.`,
       severity: chargebackSeverity,
       score_contribution: chargebackScore,
       triggered: chargeback_flagged,
     });
 
-    // NET_EARNING
+    // =========================================================================
+    // 6) NET_EARNING
+    // =========================================================================
     let net_earning_flagged = false;
     let netSeverity: MetricResult["severity"] = "NONE";
     let netScore = 0;
@@ -767,18 +786,14 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
       netSeverity = "CRITICAL";
       netScore = Math.max(netScore, RISK_WEIGHTS.negativeNetEarning + 8);
       reasons.push(
-        `Net earning has been negative for ${negativeNetEarningStreak} consecutive recent records, and the recent 3-period cumulative net earning is ${fmtMoney(
-          recent3NetEarningSum
-        )}.`
+        `Net earning has been negative for ${negativeNetEarningStreak} consecutive recent records, and the recent 3-period cumulative net earning is ${fmtMoney(recent3NetEarningSum)}.`
       );
     } else if (streakHighEligible) {
       net_earning_flagged = true;
       netSeverity = "HIGH";
       netScore = Math.max(netScore, RISK_WEIGHTS.negativeNetEarning);
       reasons.push(
-        `Net earning has been negative for ${negativeNetEarningStreak} consecutive recent records, and the latest net earning is ${fmtMoney(
-          computedNetEarning
-        )}.`
+        `Net earning has been negative for ${negativeNetEarningStreak} consecutive recent records, and the latest net earning is ${fmtMoney(computedNetEarning)}.`
       );
     }
 
@@ -787,17 +802,15 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
       metric_id: "NET_EARNING",
       value: computedNetEarning,
       unit: "$",
-      explanation: `Net earning is ${fmtMoney(computedNetEarning)} (${fmtMoney(
-        todayReceivable
-      )} receivables minus ${fmtMoney(todayChargeback)} chargebacks). Recent 3-period cumulative net earning is ${fmtMoney(
-        recent3NetEarningSum
-      )}.`,
+      explanation: `Net earning is ${fmtMoney(computedNetEarning)} (${fmtMoney(todayReceivable)} receivables minus ${fmtMoney(todayChargeback)} chargebacks). Recent 3-period cumulative net earning is ${fmtMoney(recent3NetEarningSum)}.`,
       severity: netSeverity,
       score_contribution: netScore,
       triggered: net_earning_flagged,
     });
 
-    // AVAILABLE_BALANCE
+    // =========================================================================
+    // 7) AVAILABLE_BALANCE
+    // =========================================================================
     let available_balance_flagged = false;
     let availSeverity: MetricResult["severity"] = "NONE";
     let availScore = 0;
@@ -830,38 +843,32 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
       triggered: available_balance_flagged,
     });
 
-    // DUE_FROM_SUPPLIER
+    // =========================================================================
+    // 8) DUE_FROM_SUPPLIER
+    // =========================================================================
     let due_from_supplier_flagged = false;
     let dfsSeverity: MetricResult["severity"] = "NONE";
     let dfsScore = 0;
 
     const turnedPositiveCritical =
       dueFromSupplierTurnedPositive &&
-      todayDueFromSupplier >=
-        RISK_THRESHOLDS.dueFromSupplierTurnedPositive.criticalMinAmount &&
+      todayDueFromSupplier >= RISK_THRESHOLDS.dueFromSupplierTurnedPositive.criticalMinAmount &&
       dueFromSupplierRatio !== null &&
-      dueFromSupplierRatio >=
-        RISK_THRESHOLDS.dueFromSupplierTurnedPositive.criticalMinRatio;
+      dueFromSupplierRatio >= RISK_THRESHOLDS.dueFromSupplierTurnedPositive.criticalMinRatio;
 
     if (turnedPositiveCritical) {
       due_from_supplier_flagged = true;
       dfsSeverity = "CRITICAL";
       dfsScore = RISK_WEIGHTS.dueFromSupplierPositive + 6;
       reasons.push(
-        `Due from supplier turned positive at ${fmtMoney(
-          todayDueFromSupplier
-        )}, representing ${(safeNum(dueFromSupplierRatio) * 100).toFixed(
-          1
-        )}% of outstanding exposure and suggesting part of the exposure is no longer covered by marketplace remittance.`
+        `Due from supplier turned positive at ${fmtMoney(todayDueFromSupplier)}, representing ${(safeNum(dueFromSupplierRatio) * 100).toFixed(1)}% of outstanding exposure and suggesting part of the exposure is no longer covered by marketplace remittance.`
       );
     } else if (dueFromSupplierTurnedPositive) {
       due_from_supplier_flagged = true;
       dfsSeverity = "HIGH";
       dfsScore = RISK_WEIGHTS.dueFromSupplierPositive;
       reasons.push(
-        `Due from supplier turned positive at ${fmtMoney(
-          todayDueFromSupplier
-        )}, but it does not yet meet the critical amount-and-ratio threshold.`
+        `Due from supplier turned positive at ${fmtMoney(todayDueFromSupplier)}, but it does not yet meet the critical amount-and-ratio threshold.`
       );
     } else if (
       todayDueFromSupplier > 0 &&
@@ -872,9 +879,7 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
       dfsSeverity = "HIGH";
       dfsScore = RISK_WEIGHTS.dueFromSupplierPositive;
       reasons.push(
-        `Due from supplier is ${fmtMoney(todayDueFromSupplier)}, or ${(
-          dueFromSupplierRatio * 100
-        ).toFixed(1)}% of outstanding exposure.`
+        `Due from supplier is ${fmtMoney(todayDueFromSupplier)}, or ${(dueFromSupplierRatio * 100).toFixed(1)}% of outstanding exposure.`
       );
     } else if (
       todayDueFromSupplier > 0 &&
@@ -885,9 +890,7 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
       dfsSeverity = "MEDIUM";
       dfsScore = Math.round(RISK_WEIGHTS.dueFromSupplierPositive * 0.65);
       reasons.push(
-        `Due from supplier is positive and accounts for ${(
-          dueFromSupplierRatio * 100
-        ).toFixed(1)}% of outstanding exposure.`
+        `Due from supplier is positive and accounts for ${(dueFromSupplierRatio * 100).toFixed(1)}% of outstanding exposure.`
       );
     }
 
@@ -898,32 +901,27 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
       unit: "$",
       explanation:
         todayDueFromSupplier > 0
-          ? `Due from supplier is ${fmtMoney(todayDueFromSupplier)}${
-              dueFromSupplierRatio !== null
-                ? `, representing ${(dueFromSupplierRatio * 100).toFixed(
-                    1
-                  )}% of outstanding exposure.`
-                : "."
-            }`
+          ? `Due from supplier is ${fmtMoney(todayDueFromSupplier)}${dueFromSupplierRatio !== null ? `, representing ${(dueFromSupplierRatio * 100).toFixed(1)}% of outstanding exposure.` : "."}`
           : "Due from supplier is zero or not applicable.",
       severity: dfsSeverity,
       score_contribution: dfsScore,
       triggered: due_from_supplier_flagged,
     });
 
-    // OUTSTANDING_EXPOSURE
+    // =========================================================================
+    // 9) OUTSTANDING_EXPOSURE (context only)
+    // =========================================================================
     metrics.push({
       metric_id: "OUTSTANDING_EXPOSURE",
       value: outstandingBal,
       unit: "$",
-      explanation: `Outstanding exposure is ${fmtMoney(
-        outstandingBal
-      )} and current liability is ${fmtMoney(todayLiability)}. This is provided as contextual information only.`,
+      explanation: `Outstanding exposure is ${fmtMoney(outstandingBal)} and current liability is ${fmtMoney(todayLiability)}. This is provided as contextual information only.`,
       severity: "NONE",
       score_contribution: 0,
       triggered: false,
     });
 
+    // ── Hard escalation floor ─────────────────────────────────────────────────
     const hardTriggerCount =
       Number(turnedPositiveCritical) +
       Number(streakCriticalEligible) +
@@ -942,8 +940,7 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
 
     const anyTriggered = metrics.some((m: MetricResult) => m.triggered);
     const isFlagged =
-      anyTriggered &&
-      engine_suggested_risk_score >= RISK_THRESHOLDS.minFlaggedRiskScore;
+      anyTriggered && engine_suggested_risk_score >= RISK_THRESHOLDS.minFlaggedRiskScore;
 
     return {
       ...r,
@@ -991,17 +988,9 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
     total: rows.length,
     flagged: flagged.length,
     score_distribution: {
-      "8-10 (critical)": flagged.filter(
-        (x: FlaggedSupplier) => x.engine_suggested_risk_score >= 8
-      ).length,
-      "5-7 (high)": flagged.filter(
-        (x: FlaggedSupplier) =>
-          x.engine_suggested_risk_score >= 5 && x.engine_suggested_risk_score <= 7
-      ).length,
-      "3-4 (monitor)": flagged.filter(
-        (x: FlaggedSupplier) =>
-          x.engine_suggested_risk_score >= 3 && x.engine_suggested_risk_score <= 4
-      ).length,
+      "8-10 (critical)": flagged.filter((x: FlaggedSupplier) => x.engine_suggested_risk_score >= 8).length,
+      "5-7 (high)": flagged.filter((x: FlaggedSupplier) => x.engine_suggested_risk_score >= 5 && x.engine_suggested_risk_score <= 7).length,
+      "3-4 (monitor)": flagged.filter((x: FlaggedSupplier) => x.engine_suggested_risk_score >= 3 && x.engine_suggested_risk_score <= 4).length,
     },
     policy_version: RISK_POLICY_VERSION,
   });

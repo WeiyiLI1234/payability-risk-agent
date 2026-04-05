@@ -1,5 +1,5 @@
 {
-    "crons": [
-      { "path": "/api/cron/daily-risk", "schedule": "0 13 * * *" }
-    ]
-  }
+  "crons": [
+    { "path": "/api/cron", "schedule": "0 10 * * *" }
+  ]
+}

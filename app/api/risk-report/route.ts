@@ -15,6 +15,7 @@ type ConsolidatedRow = {
   reasons: string[] | null;
   overall_risk_score: number | null;
   source: string;
+  created_date: string | null;
 };
 
 type ChangeSummary = {
@@ -118,6 +119,9 @@ export async function GET() {
   const reportDateIso = new Date().toISOString();
   const reportDate = reportDateIso.slice(0, 10);
 
+  // UTC date string for created_date — no third-party libraries needed
+  const createdDate = new Date().toISOString().slice(0, 10);
+
   try {
     console.log("[risk-report] START", reportDateIso);
 
@@ -184,16 +188,19 @@ export async function GET() {
 
     console.log("[risk-report] run row saved", { run_id: runRow.id });
 
-    // Step 4: Read current consolidated rows for this source
+    // Step 4: Read the most recent consolidated row per supplier for comparison.
+    // Order by created_date DESC so we always compare against the latest known state,
+    // even if multiple rows exist from previous days.
     const flaggedKeys = highRiskFlagged.map((s) => s.supplier_key);
     let existingMap = new Map<string, ConsolidatedRow>();
 
     if (flaggedKeys.length > 0) {
       const { data: existingRows, error: existingError } = await sb
         .from("consolidated_flagged_supplier_list")
-        .select("supplier_key, supplier_name, metrics, reasons, overall_risk_score, source")
+        .select("supplier_key, supplier_name, metrics, reasons, overall_risk_score, source, created_date")
         .eq("source", "daily_summary_report")
-        .in("supplier_key", flaggedKeys);
+        .in("supplier_key", flaggedKeys)
+        .order("created_date", { ascending: false }); // newest first
 
       if (existingError) {
         console.error("[risk-report] consolidated read failed", existingError);
@@ -202,12 +209,15 @@ export async function GET() {
         );
       }
 
-      existingMap = new Map(
-        (existingRows ?? []).map((row) => [row.supplier_key, row as ConsolidatedRow])
-      );
+      // Deduplicate: keep only the most recent row per supplier_key
+      for (const row of existingRows ?? []) {
+        if (!existingMap.has(row.supplier_key)) {
+          existingMap.set(row.supplier_key, row as ConsolidatedRow);
+        }
+      }
     }
 
-    // Step 5: Keep only NEW suppliers or suppliers whose score / reasons changed
+    // Step 5: Keep only NEW suppliers or those whose score / reasons changed
     const changedFlaggedSuppliers = highRiskFlagged.filter((s) => {
       const existing = existingMap.get(s.supplier_key);
       if (!existing) return true;
@@ -216,7 +226,6 @@ export async function GET() {
         existing.overall_risk_score,
         s.engine_suggested_risk_score
       );
-
       const reasonsDiff = reasonsChanged(
         existing.reasons,
         Array.isArray(s.flag_reasons) ? s.flag_reasons : []
@@ -260,7 +269,9 @@ export async function GET() {
       supplierRowsInserted = count ?? dailyRows.length;
     }
 
-    // Step 7: Upsert latest state into consolidated_flagged_supplier_list
+    // Step 7: Append-only upsert into consolidated_flagged_supplier_list.
+    // Conflict key: (supplier_key, source, created_date) — one row per supplier per source per day.
+    // On conflict: do nothing (ignoreDuplicates). Score history is preserved across days.
     let consolidatedRowsUpserted = 0;
 
     if (changedFlaggedSuppliers.length > 0) {
@@ -272,12 +283,14 @@ export async function GET() {
         reasons: Array.isArray(s.flag_reasons) ? s.flag_reasons : [],
         overall_risk_score: s.engine_suggested_risk_score,
         source: "daily_summary_report",
+        created_date: createdDate, // UTC date — new row each day, never overwrite
       }));
 
       const { error: upsertError, count } = await sb
         .from("consolidated_flagged_supplier_list")
         .upsert(consolidatedRows, {
-          onConflict: "supplier_key,source",
+          onConflict: "supplier_key,source,created_date", // changed from (supplier_key, source)
+          ignoreDuplicates: true,                          // do nothing on conflict
           count: "exact",
         });
 
@@ -291,7 +304,7 @@ export async function GET() {
       consolidatedRowsUpserted = count ?? consolidatedRows.length;
     }
 
-    // Step 8: Build detailed change summary for API response
+    // Step 8: Build change summary for API response
     const supplierChanges: ChangeSummary[] = changedFlaggedSuppliers.map((s) => {
       const existing = existingMap.get(s.supplier_key);
       const oldReasons = normalizeReasons(existing?.reasons);
@@ -317,7 +330,7 @@ export async function GET() {
       };
     });
 
-    // Step 9: Return only changed/new suppliers, with change summary
+    // Step 9: Build response
     const responseSuppliers = changedFlaggedSuppliers.map((s) => {
       const change = supplierChanges.find((c) => c.supplier_key === s.supplier_key);
 

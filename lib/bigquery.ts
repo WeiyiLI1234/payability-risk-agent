@@ -212,6 +212,15 @@ export async function getSupplierRiskInputData(
       GROUP BY supplier_key
     ),
 
+    -- Total transaction row count per supplier (used for Amazon order density gate)
+    transaction_counts AS (
+      SELECT
+        supplier_key,
+        COUNT(*) AS total_transaction_rows
+      FROM base
+      GROUP BY supplier_key
+    ),
+
     receivable_recent AS (
       SELECT
         supplier_key,
@@ -267,6 +276,15 @@ export async function getSupplierRiskInputData(
           OR ss.supplier_key IN (SELECT supplier_key FROM target_suppliers)
         )
       GROUP BY ss.supplier_key, order_day
+    ),
+
+    -- Total amazon order day count per supplier (used for density gate)
+    amazon_order_counts AS (
+      SELECT
+        supplier_key,
+        COUNT(*) AS total_amazon_order_rows
+      FROM amazon_orders
+      GROUP BY supplier_key
     ),
 
     amazon_order_history AS (
@@ -401,6 +419,10 @@ export async function getSupplierRiskInputData(
 
       rt.receivable_down_streak_3,
 
+      -- Amazon order density gate fields (new)
+      IFNULL(tc.total_transaction_rows, 0) AS total_transaction_rows,
+      IFNULL(aoc.total_amazon_order_rows, 0) AS total_amazon_order_rows,
+
       lao.latest_amazon_order_date,
       DATE_DIFF(CURRENT_DATE(), lao.latest_amazon_order_date, DAY) AS days_since_latest_amazon_order,
       lao.latest_amazon_orders_purchased,
@@ -426,6 +448,8 @@ export async function getSupplierRiskInputData(
       ON l.supplier_key = pgs.supplier_key
     LEFT JOIN transaction_activity ta
       ON l.supplier_key = ta.supplier_key
+    LEFT JOIN transaction_counts tc
+      ON l.supplier_key = tc.supplier_key
     LEFT JOIN receivable_trend rt
       ON l.supplier_key = rt.supplier_key
     LEFT JOIN latest_amazon_order_row lao
@@ -434,6 +458,8 @@ export async function getSupplierRiskInputData(
       ON l.supplier_key = taom.supplier_key
     LEFT JOIN amazon_order_trend aot
       ON l.supplier_key = aot.supplier_key
+    LEFT JOIN amazon_order_counts aoc
+      ON l.supplier_key = aoc.supplier_key
 
     ORDER BY l.outstanding_bal DESC
     LIMIT @limit
