@@ -755,45 +755,52 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
     });
 
     // =========================================================================
-    // 6) NET_EARNING
+    // 6) NET_EARNING — streak-based only (v4.3.3)
+    // Requires consecutive negative periods before triggering.
+    // Single-period losses are treated as normal volatility.
     // =========================================================================
     let net_earning_flagged = false;
     let netSeverity: MetricResult["severity"] = "NONE";
     let netScore = 0;
 
-    if (computedNetEarning <= RISK_THRESHOLDS.negativeNetEarning.high) {
-      net_earning_flagged = true;
-      netSeverity = "HIGH";
-      netScore = RISK_WEIGHTS.negativeNetEarning;
-      reasons.push(`Net earning is deeply negative at ${fmtMoney(computedNetEarning)}.`);
-    } else if (computedNetEarning <= RISK_THRESHOLDS.negativeNetEarning.medium) {
-      net_earning_flagged = true;
-      netSeverity = "MEDIUM";
-      netScore = Math.round(RISK_WEIGHTS.negativeNetEarning * 0.6);
-      reasons.push(`Net earning is negative at ${fmtMoney(computedNetEarning)}.`);
-    }
-
-    const streakHighEligible =
-      negativeNetEarningStreak >= 2 &&
-      computedNetEarning <= RISK_THRESHOLDS.negativeNetEarning.medium;
-
     const streakCriticalEligible =
       negativeNetEarningStreak >= 3 &&
       recent3NetEarningSum < RISK_THRESHOLDS.negativeNetEarning.critical3PeriodSum;
 
+    const streakHighEligible =
+      !streakCriticalEligible &&
+      negativeNetEarningStreak >= RISK_THRESHOLDS.negativeNetEarning.streakHigh &&
+      computedNetEarning <= RISK_THRESHOLDS.negativeNetEarning.high;
+
+    const streakMediumEligible =
+      !streakCriticalEligible &&
+      !streakHighEligible &&
+      negativeNetEarningStreak >= RISK_THRESHOLDS.negativeNetEarning.streakMedium &&
+      computedNetEarning <= RISK_THRESHOLDS.negativeNetEarning.medium;
+
     if (streakCriticalEligible) {
       net_earning_flagged = true;
       netSeverity = "CRITICAL";
-      netScore = Math.max(netScore, RISK_WEIGHTS.negativeNetEarning + 8);
+      netScore = RISK_WEIGHTS.negativeNetEarning + 8;
       reasons.push(
-        `Net earning has been negative for ${negativeNetEarningStreak} consecutive recent records, and the recent 3-period cumulative net earning is ${fmtMoney(recent3NetEarningSum)}.`
+        `Net earning has been negative for ${negativeNetEarningStreak} consecutive periods. ` +
+        `3-period cumulative net earning is ${fmtMoney(recent3NetEarningSum)}.`
       );
     } else if (streakHighEligible) {
       net_earning_flagged = true;
       netSeverity = "HIGH";
-      netScore = Math.max(netScore, RISK_WEIGHTS.negativeNetEarning);
+      netScore = RISK_WEIGHTS.negativeNetEarning;
       reasons.push(
-        `Net earning has been negative for ${negativeNetEarningStreak} consecutive recent records, and the latest net earning is ${fmtMoney(computedNetEarning)}.`
+        `Net earning has been negative for ${negativeNetEarningStreak} consecutive periods. ` +
+        `Latest net earning is ${fmtMoney(computedNetEarning)}.`
+      );
+    } else if (streakMediumEligible) {
+      net_earning_flagged = true;
+      netSeverity = "MEDIUM";
+      netScore = Math.round(RISK_WEIGHTS.negativeNetEarning * 0.6);
+      reasons.push(
+        `Net earning has been negative for ${negativeNetEarningStreak} consecutive periods. ` +
+        `Latest net earning is ${fmtMoney(computedNetEarning)}.`
       );
     }
 
@@ -802,7 +809,7 @@ export function flagSuppliers(rows: DailyChangeRow[]): FlagSuppliersResult {
       metric_id: "NET_EARNING",
       value: computedNetEarning,
       unit: "$",
-      explanation: `Net earning is ${fmtMoney(computedNetEarning)} (${fmtMoney(todayReceivable)} receivables minus ${fmtMoney(todayChargeback)} chargebacks). Recent 3-period cumulative net earning is ${fmtMoney(recent3NetEarningSum)}.`,
+      explanation: `Net earning is ${fmtMoney(computedNetEarning)} (${fmtMoney(todayReceivable)} receivables minus ${fmtMoney(todayChargeback)} chargebacks). Recent 3-period cumulative net earning is ${fmtMoney(recent3NetEarningSum)}. Consecutive negative periods: ${negativeNetEarningStreak}.`,
       severity: netSeverity,
       score_contribution: netScore,
       triggered: net_earning_flagged,

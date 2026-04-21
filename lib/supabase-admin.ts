@@ -9,7 +9,6 @@ export function supabaseAdmin(): SupabaseClient {
   const url = process.env.SUPABASE_URL;
   const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-  // Don't crash at import/build time. Only throw when actually used.
   if (!url) {
     throw new Error("SUPABASE_URL is required (missing env var).");
   }
@@ -22,4 +21,47 @@ export function supabaseAdmin(): SupabaseClient {
   });
 
   return _client;
+}
+
+type FlaggedSupplierRow = {
+  supplier_key: string;
+  supplier_name: string;
+  overall_risk_score: number;
+  metrics: object[];
+  reasons: string[];
+};
+
+export async function upsertFlaggedSuppliers(
+  suppliers: FlaggedSupplierRow[],
+  businessDate: string,
+  runId: string
+): Promise<{ inserted: number; skipped: number }> {
+  if (suppliers.length === 0) return { inserted: 0, skipped: 0 };
+
+  const sb = supabaseAdmin();
+
+  const rows = suppliers.map((s) => ({
+    supplier_key: s.supplier_key,
+    supplier_name: s.supplier_name,
+    overall_risk_score: s.overall_risk_score,
+    metrics: s.metrics,
+    reasons: s.reasons,
+    source: "risk_agent",
+    status: "flagged",
+    created_date: businessDate,
+    run_id: runId,
+    created_at: new Date().toISOString(),
+  }));
+
+  const { error } = await sb
+    .from("consolidated_flagged_supplier_list")
+    .upsert(rows, { onConflict: "supplier_key,created_date" });
+
+  if (error) {
+    throw new Error(
+      `consolidated_flagged_supplier_list upsert failed: ${error.message}`
+    );
+  }
+
+  return { inserted: suppliers.length, skipped: 0 };
 }

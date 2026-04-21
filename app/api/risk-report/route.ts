@@ -1,7 +1,9 @@
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+export const maxDuration = 120;
 
 import { NextResponse } from "next/server";
+import { randomUUID } from "crypto";
 import { getSupplierRiskInputData } from "@/lib/bigquery";
 import { flagSuppliers } from "@/lib/risk-engine";
 import type { DailyChangeRow, FlaggedSupplier } from "@/lib/risk-engine";
@@ -9,7 +11,8 @@ import { RISK_THRESHOLDS } from "@/lib/risk-policy";
 import {
   getBusinessDateNY,
   upsertDailySummaryRunLog,
-} from "../../../lib/agentRunLogs";
+} from "@/lib/agentRunLogs";
+import { upsertFlaggedSuppliers } from "@/lib/supabase-admin";
 
 function buildSimpleFlaggedOutput(flagged: FlaggedSupplier[], reportDate: string) {
   return {
@@ -29,8 +32,11 @@ function buildSimpleFlaggedOutput(flagged: FlaggedSupplier[], reportDate: string
               unit: m.unit,
             }))
         : [],
-      trigger_reason: Array.isArray(s.flag_reasons) ? s.flag_reasons.join(" ") : "",
+      trigger_reason: Array.isArray(s.flag_reasons)
+        ? s.flag_reasons.join(" ")
+        : "",
       overall_risk_score: s.engine_suggested_risk_score,
+      reasons: Array.isArray(s.flag_reasons) ? s.flag_reasons : [],
     })),
   };
 }
@@ -39,18 +45,12 @@ export async function GET() {
   const start = Date.now();
   const reportDateIso = new Date().toISOString();
   const businessDate = getBusinessDateNY();
-  const reportDate = businessDate;
+  const runId = randomUUID();
 
   try {
-    console.log("[risk-report] START", {
-      reportDateIso,
-      businessDate,
-    });
+    console.log("[risk-report] START", { reportDateIso, businessDate, runId });
 
-    const rowsRaw = await getSupplierRiskInputData({
-      limit: 5000,
-    });
-
+    const rowsRaw = await getSupplierRiskInputData({ limit: 5000 });
     const rows = (Array.isArray(rowsRaw) ? rowsRaw : []) as DailyChangeRow[];
 
     console.log("[risk-report] BigQuery done", {
@@ -65,12 +65,10 @@ export async function GET() {
         success: true,
         skipped: true,
         reason: "No eligible supplier rows returned from BigQuery",
-        report_date: reportDate,
+        report_date: businessDate,
         business_date: businessDate,
         scanned_supplier_count: 0,
         flagged_supplier_count: 0,
-        returned_supplier_count: 0,
-        suppliers_reviewed: 0,
         suppliers: [],
       });
     }
@@ -80,28 +78,43 @@ export async function GET() {
     console.log("[risk-report] Risk engine done", {
       total: result.total,
       flagged: result.flagged.length,
-      unflagged: result.unflagged.length,
       ms: Date.now() - start,
     });
 
-    const highRiskFlagged = result.flagged.filter(
-      (s) => s.engine_suggested_risk_score >= RISK_THRESHOLDS.minFlaggedRiskScore
+    const simpleOutput = buildSimpleFlaggedOutput(result.flagged, businessDate);
+
+    // Write flagged suppliers to Supabase
+    await upsertFlaggedSuppliers(
+      simpleOutput.suppliers.map((s) => ({
+        supplier_key: s.supplier_key,
+        supplier_name: s.supplier_name,
+        overall_risk_score: s.overall_risk_score,
+        metrics: s.metrics,
+        reasons: s.reasons,
+      })),
+      businessDate,
+      runId
     );
 
-    const simpleOutput = buildSimpleFlaggedOutput(highRiskFlagged, reportDate);
+    console.log("[risk-report] Supabase upsert done", {
+      count: simpleOutput.suppliers.length,
+      ms: Date.now() - start,
+    });
 
     await upsertDailySummaryRunLog("success", businessDate);
 
     return NextResponse.json({
       success: true,
+      report_date: businessDate,
       business_date: businessDate,
+      run_id: runId,
       scanned_supplier_count: result.total,
-      flagged_supplier_count: highRiskFlagged.length,
-      returned_supplier_count: simpleOutput.suppliers.length,
-      ...simpleOutput,
+      flagged_supplier_count: result.flagged.length,
+      suppliers: simpleOutput.suppliers,
     });
-  } catch (error: any) {
-    console.error("[risk-report] ERROR", error);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error("[risk-report] ERROR", message);
 
     try {
       await upsertDailySummaryRunLog("failed", businessDate);
@@ -112,7 +125,7 @@ export async function GET() {
     return NextResponse.json(
       {
         success: false,
-        error: error?.message ?? String(error),
+        error: message,
         report_date: reportDateIso,
         business_date: businessDate,
       },

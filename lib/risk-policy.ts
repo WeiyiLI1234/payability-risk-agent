@@ -1,4 +1,4 @@
-export const RISK_POLICY_VERSION = "v4.3.2";
+export const RISK_POLICY_VERSION = "v4.3.3";
 
 export const RISK_THRESHOLDS = {
   receivableSurge: {
@@ -27,16 +27,13 @@ export const RISK_THRESHOLDS = {
   },
 
   amazonOrderActivityDrop: {
-    // Gate 2: data quality — skip if order data is too sparse across transaction history
-    dataQualityMinTotalTransactionRows: 20,  // only apply gate if supplier has meaningful history
-    dataQualityMaxOrderDensity: 0.10,         // skip if <10% of transaction rows have order data
+    dataQualityMinTotalTransactionRows: 20,
+    dataQualityMaxOrderDensity: 0.10,
 
-    // Gate 3: recency routing
-    activeWindowDays: 30,          // ≤ 30d → eligible for period-over-period drop detection
-    stopSellingMaxDays: 90,        // 31–90d + density ≥ threshold → recent stop-selling signal
-    stopSellingMinDensity: 0.30,   // require ≥ 30% historical density to qualify as stop-selling
+    activeWindowDays: 30,
+    stopSellingMaxDays: 90,
+    stopSellingMinDensity: 0.30,
 
-    // Drop detection thresholds (Gate 3a: ≤ activeWindowDays)
     wowMediumDropPct: 50,
     wowHighDropPct: 70,
 
@@ -76,9 +73,16 @@ export const RISK_THRESHOLDS = {
   },
 
   negativeNetEarning: {
+    // Streak gates — minimum consecutive negative periods required
+    streakMedium: 2,
+    streakHigh: 3,
+
+    // Per-period amount thresholds (applied after streak gate is met)
     medium: -500,
     high: -10_000,
-    critical3PeriodSum: -1_000,
+
+    // CRITICAL: streak >= 3 AND 3-period cumulative below this
+    critical3PeriodSum: -5_000,
   },
 
   negativeAvailableBalance: {

@@ -184,22 +184,32 @@ ${JSON.stringify(payload)}
 
   const suppliers = Array.isArray(parsedObj.suppliers) ? parsedObj.suppliers : [];
 
+  // Build lookup map by supplier_key — do NOT rely on array index
+  const inputByKey = new Map<string, InputSupplierForLLM>(
+    payload.map((s) => [s.supplier_key, s])
+  );
+
   const report: RiskReportOutput = {
     report_date: String(parsedObj.report_date ?? reportDate),
     suppliers_reviewed: safeNum(parsedObj.suppliers_reviewed ?? payload.length),
-    suppliers: suppliers.map((x, idx) => {
-      const inputSupplier: InputSupplierForLLM | undefined = payload[idx];
+    suppliers: suppliers.map((x) => {
+      const inputSupplier = inputByKey.get(String(x?.supplier_key ?? ""));
 
       const metrics: FinalMetricEntry[] = Array.isArray(x?.metrics)
-        ? x.metrics.map((m) => ({
-            metric_id: String(m?.metric_id ?? ""),
-            value: m?.value === null ? null : safeNum(m?.value),
-            unit: String(m?.unit ?? ""),
-          }))
+        ? x.metrics
+            .filter((m, i, arr) =>
+              // dedupe: keep first occurrence of each metric_id
+              arr.findIndex((n) => n?.metric_id === m?.metric_id) === i
+            )
+            .map((m) => ({
+              metric_id: String(m?.metric_id ?? ""),
+              value: m?.value === null ? null : safeNum(m?.value),
+              unit: String(m?.unit ?? ""),
+            }))
         : [];
 
       const filteredMetrics = metrics.filter((m) =>
-        inputSupplier?.metrics?.some((im: { metric_id: string }) => im.metric_id === m.metric_id)
+        inputSupplier?.metrics?.some((im) => im.metric_id === m.metric_id)
       );
 
       const fallbackTriggerReason = dedupeStrings([
@@ -218,7 +228,9 @@ ${JSON.stringify(payload)}
           1,
           Math.min(
             10,
-            Math.round(safeNum(x?.overall_risk_score ?? inputSupplier?.overall_risk_score ?? 5))
+            Math.round(
+              safeNum(x?.overall_risk_score ?? inputSupplier?.overall_risk_score ?? 5)
+            )
           )
         ),
       };
