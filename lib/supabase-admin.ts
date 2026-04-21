@@ -65,7 +65,7 @@ export async function upsertFlaggedSuppliers(
     source: "risk_agent",
     status: "pending_review",
     created_date: businessDate,
-    run_id: runId,
+    run_id: null,
     created_at: new Date().toISOString(),
   }));
 
