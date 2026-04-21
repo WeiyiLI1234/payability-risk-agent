@@ -63,7 +63,7 @@ export async function upsertFlaggedSuppliers(
     metrics: s.metrics,
     reasons: s.reasons,
     source: "risk_agent",
-    status: "flagged",
+    status: "pending_review",
     created_date: businessDate,
     run_id: runId,
     created_at: new Date().toISOString(),
