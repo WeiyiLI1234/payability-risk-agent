@@ -62,7 +62,7 @@ export async function upsertFlaggedSuppliers(
     overall_risk_score: s.overall_risk_score,
     metrics: s.metrics,
     reasons: s.reasons,
-    source: "risk_agent",
+    source: "daily_summary_report",
     status: "pending_review",
     created_date: businessDate,
     run_id: null,
