@@ -40,6 +40,22 @@ export async function upsertFlaggedSuppliers(
 
   const sb = supabaseAdmin();
 
+  // Delete today's existing records for these suppliers before reinserting
+  const { error: deleteError } = await sb
+    .from("consolidated_flagged_supplier_list")
+    .delete()
+    .eq("created_date", businessDate)
+    .in(
+      "supplier_key",
+      suppliers.map((s) => s.supplier_key)
+    );
+
+  if (deleteError) {
+    throw new Error(
+      `consolidated_flagged_supplier_list delete failed: ${deleteError.message}`
+    );
+  }
+
   const rows = suppliers.map((s) => ({
     supplier_key: s.supplier_key,
     supplier_name: s.supplier_name,
@@ -53,13 +69,13 @@ export async function upsertFlaggedSuppliers(
     created_at: new Date().toISOString(),
   }));
 
-  const { error } = await sb
+  const { error: insertError } = await sb
     .from("consolidated_flagged_supplier_list")
-    .upsert(rows, { onConflict: "supplier_key,created_date" });
+    .insert(rows);
 
-  if (error) {
+  if (insertError) {
     throw new Error(
-      `consolidated_flagged_supplier_list upsert failed: ${error.message}`
+      `consolidated_flagged_supplier_list insert failed: ${insertError.message}`
     );
   }
 
