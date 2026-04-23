@@ -13,22 +13,23 @@ export async function GET(request: Request) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  try {
-    const baseUrl = process.env.NEXT_PUBLIC_APP_URL || "https://payability-risk-agent.vercel.app";
+  const baseUrl =
+    process.env.NEXT_PUBLIC_APP_URL || "https://payability-risk-agent.vercel.app";
 
-    // Step 1: Run risk report
+  try {
     const riskRes = await fetch(`${baseUrl}/api/risk-report`);
+
+    if (!riskRes.ok) {
+      const body = await riskRes.text();
+      throw new Error(`Risk report failed with status ${riskRes.status}: ${body}`);
+    }
+
     const riskData = await riskRes.json();
 
     console.log("[cron] Risk report done", {
+      scanned: riskData.scanned_supplier_count,
       flagged: riskData.flagged_supplier_count,
     });
-
-    // Step 2: Send Slack alert
-    const slackRes = await fetch(`${baseUrl}/api/slack-alert`);
-    const slackData = await slackRes.json();
-
-    console.log("[cron] Slack alert done", slackData);
 
     return NextResponse.json({
       success: true,
@@ -36,10 +37,13 @@ export async function GET(request: Request) {
         scanned: riskData.scanned_supplier_count,
         flagged: riskData.flagged_supplier_count,
       },
-      slack: slackData,
     });
-  } catch (error: any) {
-    console.error("[cron] ERROR", error);
-    return NextResponse.json({ success: false, error: error.message }, { status: 500 });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error("[cron] ERROR", message);
+    return NextResponse.json(
+      { success: false, error: message },
+      { status: 500 }
+    );
   }
 }

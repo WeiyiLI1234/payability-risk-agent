@@ -6,40 +6,13 @@ import { NextResponse } from "next/server";
 import { randomUUID } from "crypto";
 import { getSupplierRiskInputData } from "@/lib/bigquery";
 import { flagSuppliers } from "@/lib/risk-engine";
-import type { DailyChangeRow, FlaggedSupplier } from "@/lib/risk-engine";
-import { RISK_THRESHOLDS } from "@/lib/risk-policy";
+import type { DailyChangeRow } from "@/lib/risk-engine";
 import {
   getBusinessDateNY,
   upsertDailySummaryRunLog,
 } from "@/lib/agentRunLogs";
+import { generateRiskReportJSON } from "@/lib/ai-report";
 import { upsertFlaggedSuppliers } from "@/lib/supabase-admin";
-
-function buildSimpleFlaggedOutput(flagged: FlaggedSupplier[], reportDate: string) {
-  return {
-    report_date: reportDate,
-    suppliers_reviewed: flagged.length,
-    suppliers: flagged.map((s) => ({
-      table_name: "vm_transaction_summary",
-      supplier_key: s.supplier_key,
-      supplier_name: s.supplier_name,
-      report_date: reportDate,
-      metrics: Array.isArray(s.metrics)
-        ? s.metrics
-            .filter((m) => Number(m?.score_contribution ?? 0) > 0)
-            .map((m) => ({
-              metric_id: m.metric_id,
-              value: m.value,
-              unit: m.unit,
-            }))
-        : [],
-      trigger_reason: Array.isArray(s.flag_reasons)
-        ? s.flag_reasons.join(" ")
-        : "",
-      overall_risk_score: s.engine_suggested_risk_score,
-      reasons: Array.isArray(s.flag_reasons) ? s.flag_reasons : [],
-    })),
-  };
-}
 
 export async function GET() {
   const start = Date.now();
@@ -73,6 +46,7 @@ export async function GET() {
       });
     }
 
+    // Step 1: Rule engine
     const result = flagSuppliers(rows);
 
     console.log("[risk-report] Risk engine done", {
@@ -81,23 +55,30 @@ export async function GET() {
       ms: Date.now() - start,
     });
 
-    const simpleOutput = buildSimpleFlaggedOutput(result.flagged, businessDate);
+    // Step 2: AI layer — LLM润色 trigger_reason，轻微校准 overall_risk_score
+    const report = await generateRiskReportJSON(result.flagged);
 
-    // Write flagged suppliers to Supabase
-    await upsertFlaggedSuppliers(
-      simpleOutput.suppliers.map((s) => ({
+    console.log("[risk-report] AI report done", {
+      suppliers_in_report: report.suppliers.length,
+      ms: Date.now() - start,
+    });
+
+    // Step 3: Write to Supabase
+    const { inserted, skipped } = await upsertFlaggedSuppliers(
+      report.suppliers.map((s) => ({
         supplier_key: s.supplier_key,
         supplier_name: s.supplier_name,
         overall_risk_score: s.overall_risk_score,
         metrics: s.metrics,
-        reasons: s.reasons,
+        reasons: [s.trigger_reason],
       })),
       businessDate,
       runId
     );
 
     console.log("[risk-report] Supabase upsert done", {
-      count: simpleOutput.suppliers.length,
+      inserted,
+      skipped,
       ms: Date.now() - start,
     });
 
@@ -109,8 +90,8 @@ export async function GET() {
       business_date: businessDate,
       run_id: runId,
       scanned_supplier_count: result.total,
-      flagged_supplier_count: result.flagged.length,
-      suppliers: simpleOutput.suppliers,
+      flagged_supplier_count: report.suppliers.length,
+      suppliers: report.suppliers,
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
