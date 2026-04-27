@@ -143,7 +143,7 @@ ${JSON.stringify(payload)}
 `.trim();
 
   const { text } = await generateText({
-    model: "openai/gpt-4o-mini",
+    model: "openai/gpt-4o",
     system,
     prompt,
     temperature: 0.2,
