@@ -36,14 +36,25 @@ function buildFallbackSupplier(s: FlaggedSupplier, reportDate: string) {
   };
 }
 
-export async function GET() {
+export async function GET(request: Request) {
   const start = Date.now();
   const reportDateIso = new Date().toISOString();
   const businessDate = getBusinessDateNY();
   const runId = randomUUID();
 
+  // Dry-run: ?dry_run=true in URL, or DAILY_SUMMARY_DRY_RUN=true env var
+  const url = new URL(request.url);
+  const isDryRun =
+    url.searchParams.get("dry_run") === "true" ||
+    process.env.DAILY_SUMMARY_DRY_RUN === "true";
+
   try {
-    console.log("[risk-report] START", { reportDateIso, businessDate, runId });
+    console.log("[risk-report] START", {
+      reportDateIso,
+      businessDate,
+      runId,
+      dry_run: isDryRun,
+    });
 
     const rowsRaw = await getSupplierRiskInputData({ limit: 5000 });
     const rows = (Array.isArray(rowsRaw) ? rowsRaw : []) as DailyChangeRow[];
@@ -54,10 +65,15 @@ export async function GET() {
     });
 
     if (rows.length === 0) {
-      await upsertDailySummaryRunLog("skipped", businessDate);
+      if (!isDryRun) {
+        await upsertDailySummaryRunLog("skipped", businessDate);
+      } else {
+        console.log("[risk-report] DRY RUN — skipping agent_run_logs write");
+      }
 
       return NextResponse.json({
         success: true,
+        dry_run: isDryRun,
         skipped: true,
         reason: "No eligible supplier rows returned from BigQuery",
         report_date: businessDate,
@@ -108,7 +124,26 @@ export async function GET() {
 
     const allSuppliers = [...aiReport.suppliers, ...lowRiskSuppliers];
 
-    // Write to Supabase
+    if (isDryRun) {
+      // DRY RUN — skip all Supabase writes
+      console.log(
+        "[risk-report] DRY RUN — skipping Supabase writes and agent_run_logs"
+      );
+      return NextResponse.json({
+        success: true,
+        dry_run: true,
+        report_date: businessDate,
+        business_date: businessDate,
+        run_id: runId,
+        scanned_supplier_count: result.total,
+        flagged_supplier_count: allSuppliers.length,
+        ai_processed_count: aiReport.suppliers.length,
+        fallback_count: lowRiskSuppliers.length,
+        suppliers: allSuppliers,
+      });
+    }
+
+    // Write to Supabase (production only)
     const { inserted, skipped } = await upsertFlaggedSuppliers(
       allSuppliers.map((s) => ({
         supplier_key: s.supplier_key,
@@ -131,6 +166,7 @@ export async function GET() {
 
     return NextResponse.json({
       success: true,
+      dry_run: false,
       report_date: businessDate,
       business_date: businessDate,
       run_id: runId,
@@ -144,15 +180,18 @@ export async function GET() {
     const message = error instanceof Error ? error.message : String(error);
     console.error("[risk-report] ERROR", message);
 
-    try {
-      await upsertDailySummaryRunLog("failed", businessDate);
-    } catch (logError) {
-      console.error("[risk-report] failed to write agent_run_logs", logError);
+    if (!isDryRun) {
+      try {
+        await upsertDailySummaryRunLog("failed", businessDate);
+      } catch (logError) {
+        console.error("[risk-report] failed to write agent_run_logs", logError);
+      }
     }
 
     return NextResponse.json(
       {
         success: false,
+        dry_run: isDryRun,
         error: message,
         report_date: reportDateIso,
         business_date: businessDate,
